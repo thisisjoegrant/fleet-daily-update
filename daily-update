@@ -360,6 +360,21 @@ HELP_EOF
 
 # --- 0. Setup ----------------------------------------------------------------
 
+# Expand bundled short flags (e.g. -ds -> -d -s) so every loop below that
+# scans "$@" sees them as separate tokens. Long options (--foo) are left
+# alone since they don't start with a single dash followed by 2+ letters.
+expanded_args=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^-[a-zA-Z]{2,}$ ]]; then
+        for (( i=1; i<${#arg}; i++ )); do
+            expanded_args+=("-${arg:$i:1}")
+        done
+    else
+        expanded_args+=("$arg")
+    fi
+done
+set -- "${expanded_args[@]}"
+
 for arg in "$@"; do
     case "$arg" in
         -h|--help) show_help; exit 0 ;;

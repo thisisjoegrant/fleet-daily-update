@@ -32,6 +32,8 @@ Running `daily-update` with no flags does all of the following, in order:
    - Starts `fleet serve`, `ngrok start local`, and (if configured)
      `python3 -m http.server` in their own tmux windows, which keep running
      after the script exits.
+   - If the shared folder is enabled, prints the local IP so you can reach
+     it from another device (see below — your IP can change between runs).
    - Starts a `watchdog` window that polls those processes and fires a
      macOS notification if one of them exits unexpectedly.
 
@@ -47,9 +49,10 @@ Running `daily-update` with no flags does all of the following, in order:
 | `python3` | optional shared-folder server | preinstalled on macOS |
 | `nvm` | only used if `make deps` fails on a node version mismatch | `brew install nvm` |
 
-`osascript` (for watchdog notifications) is built into macOS — nothing to
-install. If you don't see notification banners, check
-**System Settings → Notifications** for your terminal app.
+`osascript` (for watchdog notifications) and `ipconfig` (for the shared-folder
+IP) are both built into macOS — nothing to install. If you don't see
+notification banners, check **System Settings → Notifications** for your
+terminal app.
 
 ## Installation
 
@@ -92,7 +95,8 @@ won't see these prompts again unless:
 in which case it re-runs the wizard automatically before continuing.
 
 Leaving the shared-folder prompt blank disables `python3 -m http.server`
-entirely — no window, no shutdown attempt, no watchdog entry for it.
+entirely — no window, no shutdown attempt, no watchdog entry, no IP lookup
+for it.
 
 You can also trigger the wizard manually anytime you want to change something
 (e.g. add/remove the shared folder, or point at a different Fleet checkout):
@@ -124,6 +128,10 @@ daily-update --tuf
 | `--setup` | Run the configuration wizard and exit. |
 | `--tuf` | Run the separate TUF build flow instead of the normal steps (see below). |
 
+Short flags can be combined: `-d` and `-s` can be written together as `-ds`
+or `-sd`, same as `-d -s`. This works for any current or future single-letter
+flags, so `-dsh` etc. would also expand correctly.
+
 ### Examples
 
 ```bash
@@ -132,10 +140,10 @@ daily-update my-branch        # switch to my-branch, still prompts for backups
 daily-update -d               # fully automatic, stay on current branch
 daily-update my-branch -d     # auto mode, but switch to my-branch first
 daily-update -s               # normal interactive flow, quiet output
-daily-update -d -s            # fully automatic AND quiet
+daily-update -ds              # fully automatic AND quiet (same as -d -s)
 daily-update --setup          # reconfigure FLEET_DIR/SHARED_DIR/BACKUP_DIR
-daily-update --tuf             # run the separate TUF build flow
-daily-update --tuf -s          # TUF build flow, quiet output
+daily-update --tuf            # run the separate TUF build flow
+daily-update --tuf -s         # TUF build flow, quiet output
 ```
 
 ## `--tuf` mode
@@ -170,6 +178,21 @@ with a migration-looking error, you'll be offered:
 In `-d` (auto) mode, backups are skipped and a migration failure
 auto-resolves via `make db-reset`, without asking.
 
+## Shared folder (python http.server)
+
+If `SHARED_DIR` is configured, `daily-update` starts
+`python3 -m http.server` in that directory as part of spinning back up, and
+prints where to reach it:
+
+```
+==> Shared folder available at 192.168.1.42:8000
+```
+
+The IP is looked up fresh on every run via `ipconfig getifaddr en0`, since
+local IPs can change. If it can't be determined (e.g. `en0` isn't your active
+network interface), you'll get a warning telling you to check the `pyserver`
+tmux window directly instead.
+
 ## Tmux session
 
 Everything long-running lives in a tmux session named `fleet-dev`:
@@ -198,3 +221,10 @@ tmux attach -t fleet-dev     # view any window
   `missing...migration` (case-insensitive) in `fleet prepare db --dev`'s
   output — if a real migration failure ever uses different wording, it'll
   fall through to a plain failure instead of offering backup/reset.
+- The NVM-fallback detector for `make deps` looks for the word `nvm`
+  anywhere, or `node` together with `version`/`engine`/`incompatible`
+  anywhere in the output (order-independent) — this covers the yarn
+  "engine incompatible" error format as well as more typical phrasing.
+- The shared-folder IP lookup assumes `en0` is your active network
+  interface (typical for Wi-Fi on most Macs). If you're primarily on a
+  different interface, the printed IP may be wrong or missing.
