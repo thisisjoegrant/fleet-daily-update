@@ -231,7 +231,7 @@ build_fleet() {
     if [[ $status -ne 0 ]]; then
         # Only take the NVM detour if the failure actually looks version-related,
         # rather than blindly retrying every failure that way.
-        if grep -qiE 'nvm|node .*(version|engine)|unsupported engine|wrong node' "$LAST_LOG"; then
+        if grep -qi 'nvm' "$LAST_LOG" || { grep -qi 'node' "$LAST_LOG" && grep -qiE 'version|engine|incompatible' "$LAST_LOG"; }; then
             warn "make deps failed and looks like an NVM/node version issue. Retrying via NVM..."
             if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
                 # shellcheck disable=SC1090
