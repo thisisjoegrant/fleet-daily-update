@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# --- Config -----------------------------------------------------------------
+# FLEET_DIR / SHARED_DIR / BACKUP_DIR live in a small config file, not here,
+# so you don't have to re-edit the script itself when a path changes — see
+# run_setup() below. Run `daily-update --setup` to (re)configure them.
+
+CONFIG_FILE="$HOME/.daily-update.conf"
+TMUX_SESSION="fleet-dev"
+WATCHDOG_SCRIPT="$HOME/.daily-update-watchdog.sh"
+
+# --- Colors / helpers --------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+DIM='\033[2m'      # used for raw command output, to distinguish from our own messages
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}==>${NC} $1"; }
+warn()  { echo -e "${YELLOW}==>${NC} $1"; }
+error() { echo -e "${RED}==>${NC} $1"; }
+
+TMPFILES=()
+cleanup() {
+    for f in "${TMPFILES[@]:-}"; do
+        [[ -f "$f" ]] && rm -f "$f"
+    done
+}
+trap cleanup EXIT INT TERM
+
+# Runs a command, streams its output live (dimmed, to visually separate it
+# from our own info/warn/error lines), and logs it to a temp file so the
+# real error text can be shown/inspected if the command fails.
+#
+# Usage: run_step "description" cmd arg1 arg2 ...
+# Sets: LAST_LOG (path to the full captured output of the most recent call)
+# Returns: the command's real exit status (does NOT exit on failure)
+run_step() {
+    local desc="$1"; shift
+    local logfile rcfile status
+    logfile=$(mktemp); rcfile=$(mktemp)
+    TMPFILES+=("$logfile" "$rcfile")
+
+    info "$desc"
+
+    { "$@" 2>&1; echo $? > "$rcfile"; } | while IFS= read -r line; do
+        if [[ "$SILENT" != "true" ]]; then
+            echo -e "${DIM}${line}${NC}"
+        fi
+        echo "$line" >> "$logfile"
+    done
+
+    status=$(<"$rcfile")
+    LAST_LOG="$logfile"
+    return "$status"
+}
+
+# Prints a captured log's tail and exits. Call after a run_step failure.
+die_with_log() {
+    local desc="$1" log="$2"
+    error "Failed: ${desc}"
+    if [[ -s "$log" ]]; then
+        echo -e "${RED}--- Error output ---${NC}"
+        tail -n 20 "$log"
+    fi
+    exit 1
+}
+
+require_tmux() {
+    command -v tmux >/dev/null 2>&1 || die_with_log "tmux is required for this script. Install it with: brew install tmux" /dev/null
+}
+
+tmux_window_exists() {
+    tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$1"
+}
+
+send_ctrl_c() {
+    local window="$1"
+    if tmux_window_exists "$window"; then
+        info "Stopping '${window}' (Ctrl-C)..."
+        tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
+        sleep 1
+    else
+        warn "No '${window}' tmux window found — skipping."
+    fi
+}
+
+# Prompts for an optional backup filename and runs backup.sh if one is given.
+backup_db_prompt() {
+    local prompt="$1" backup_name
+    read -rp "$prompt" backup_name
+    if [[ -n "$backup_name" ]]; then
+        backup_name="${backup_name%.sql.gz}.sql.gz"
+        run_step "Backing up db to ${backup_name}" "$FLEET_DIR/tools/backup_db/backup.sh" "$backup_name"
+        status=$?; [[ $status -ne 0 ]] && die_with_log "db backup (${backup_name})" "$LAST_LOG"
+    fi
+}
+
+# Populates the global `available_backups` array and prints it.
+list_available_backups() {
+    available_backups=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && available_backups+=("$f")
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -name '*.sql.gz' -exec basename {} \; 2>/dev/null | sort)
+
+    if [[ ${#available_backups[@]} -gt 0 ]]; then
+        echo "Available backups in ${BACKUP_DIR}:"
+        printf '  %s\n' "${available_backups[@]}"
+    else
+        echo "No existing backups found in ${BACKUP_DIR}."
+    fi
+}
+
+# Matches user input against `available_backups`, with or without .sql.gz suffix.
+# Prints the matched filename, or nothing if no match.
+match_backup() {
+    local input="$1" b
+    for b in "${available_backups[@]}"; do
+        if [[ "$b" == "$input" || "$b" == "${input}.sql.gz" ]]; then
+            echo "$b"
+            return 0
+        fi
+    done
+    return 1
+}
+
+restore_db() {
+    local file="$1"
+    run_step "Restoring db from ${file}" "$FLEET_DIR/tools/backup_db/restore.sh" "$file"
+    status=$?; [[ $status -ne 0 ]] && die_with_log "db restore (${file})" "$LAST_LOG"
+}
+
+# Writes a small standalone script that polls the db/ngrok/pyserver tmux
+# windows and fires a macOS notification (+ a log line inside its own tmux
+# window) if the process running in one of them changes unexpectedly —
+# i.e. it crashed/exited and the pane fell back to a plain shell.
+write_watchdog_script() {
+    local expected_entries='[db]="fleet" [ngrok]="ngrok"'
+    if [[ -n "$SHARED_DIR" ]]; then
+        expected_entries="${expected_entries} [pyserver]=\"python3\""
+    fi
+
+    cat > "$WATCHDOG_SCRIPT" <<WATCHDOG_EOF
+#!/usr/bin/env bash
+SESSION="${TMUX_SESSION}"
+declare -A EXPECTED=( ${expected_entries} )
+declare -A ALERTED=()
+
+notify() {
+    local msg="\$1"
+    osascript -e "display notification \"\${msg}\" with title \"daily-update\"" 2>/dev/null
+    echo "[\$(date '+%H:%M:%S')] \${msg}"
+}
+
+while tmux has-session -t "\$SESSION" 2>/dev/null; do
+    for window in "\${!EXPECTED[@]}"; do
+        if tmux list-windows -t "\$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "\$window"; then
+            current=\$(tmux list-panes -t "\${SESSION}:\${window}" -F '#{pane_current_command}' 2>/dev/null | head -n1)
+            expected="\${EXPECTED[\$window]}"
+            if [[ -n "\$current" && "\$current" != "\$expected" && -z "\${ALERTED[\$window]:-}" ]]; then
+                notify "'\${window}' exited unexpectedly (expected '\${expected}', now '\${current}')"
+                ALERTED[\$window]=1
+            elif [[ "\$current" == "\$expected" ]]; then
+                ALERTED[\$window]=""
+            fi
+        fi
+    done
+    sleep 5
+done
+echo "[\$(date '+%H:%M:%S')] tmux session '\${SESSION}' ended — watchdog exiting."
+WATCHDOG_EOF
+    chmod +x "$WATCHDOG_SCRIPT"
+}
+
+# Interactive first-run / reconfigure wizard. Writes FLEET_DIR, SHARED_DIR,
+# and BACKUP_DIR to CONFIG_FILE. SHARED_DIR can be left blank to skip the
+# python http.server step entirely.
+run_setup() {
+    echo "daily-update setup"
+    echo "------------------"
+    echo ""
+
+    local default_fleet_dir="$HOME/fleet"
+    read -rp "Fleet repo directory [${default_fleet_dir}]: " input_fleet_dir
+    FLEET_DIR="${input_fleet_dir:-$default_fleet_dir}"
+    while [[ ! -f "${FLEET_DIR}/Makefile" ]]; do
+        warn "No Makefile found at '${FLEET_DIR}' — that doesn't look like the Fleet repo."
+        read -rp "Fleet repo directory: " input_fleet_dir
+        [[ -n "$input_fleet_dir" ]] && FLEET_DIR="$input_fleet_dir"
+    done
+
+    echo ""
+    read -rp "Directory to serve via 'python3 -m http.server' (leave blank to skip this entirely): " SHARED_DIR
+
+    echo ""
+    local default_backup_dir="${FLEET_DIR}/tools/backup_db"
+    read -rp "Db backup directory [${default_backup_dir}]: " input_backup_dir
+    BACKUP_DIR="${input_backup_dir:-$default_backup_dir}"
+
+    cat > "$CONFIG_FILE" <<CONF_EOF
+FLEET_DIR="${FLEET_DIR}"
+SHARED_DIR="${SHARED_DIR}"
+BACKUP_DIR="${BACKUP_DIR}"
+CONF_EOF
+
+    echo ""
+    info "Saved config to ${CONFIG_FILE}:"
+    echo "  FLEET_DIR=${FLEET_DIR}"
+    echo "  SHARED_DIR=${SHARED_DIR:-<not set — python http.server will be skipped>}"
+    echo "  BACKUP_DIR=${BACKUP_DIR}"
+}
+
+# Loads CONFIG_FILE if present and FLEET_DIR in it still looks valid.
+# Returns non-zero (triggering setup) if the file is missing or FLEET_DIR
+# no longer points at a real Fleet checkout.
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    [[ -n "${FLEET_DIR:-}" && -f "${FLEET_DIR}/Makefile" ]] || return 1
+    return 0
+}
+
+# Runs make deps (with NVM fallback) + make generate + make build.
+# Used both by the normal flow and by --tuf mode.
+build_fleet() {
+    run_step "Running make deps" make deps
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        # Only take the NVM detour if the failure actually looks version-related,
+        # rather than blindly retrying every failure that way.
+        if grep -qiE 'nvm|node .*(version|engine)|unsupported engine|wrong node' "$LAST_LOG"; then
+            warn "make deps failed and looks like an NVM/node version issue. Retrying via NVM..."
+            if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+                # shellcheck disable=SC1090
+                source "$HOME/.nvm/nvm.sh"
+            else
+                die_with_log "make deps (could not find ~/.nvm/nvm.sh to fall back)" "$LAST_LOG"
+            fi
+            run_step "Running nvm use 24" nvm use 24
+            status=$?; [[ $status -ne 0 ]] && die_with_log "nvm use 24" "$LAST_LOG"
+
+            run_step "Retrying make deps" make deps
+            status=$?; [[ $status -ne 0 ]] && die_with_log "make deps (after NVM fallback)" "$LAST_LOG"
+        else
+            die_with_log "make deps" "$LAST_LOG"
+        fi
+    fi
+
+    run_step "Running make generate" make generate
+    status=$?; [[ $status -ne 0 ]] && die_with_log "make generate" "$LAST_LOG"
+
+    run_step "Running make build" make build
+    status=$?; [[ $status -ne 0 ]] && die_with_log "make build" "$LAST_LOG"
+}
+
+# --tuf mode: an entirely separate flow from the normal daily-update steps.
+# Builds main on top of a TUF server, then returns you to whatever branch
+# you started on and rebuilds that too. Does not touch docker/tmux/db at all.
+run_tuf_flow() {
+    local original_branch
+    original_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
+    info "Currently on '${original_branch}' — will switch back here once the TUF build is done."
+
+    run_step "Switching to main" git checkout main
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout main" "$LAST_LOG"
+
+    run_step "Pulling latest changes" git pull
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git pull" "$LAST_LOG"
+
+    build_fleet
+
+    run_step "Running my_tuf.sh" "$FLEET_DIR/my_tuf.sh"
+    status=$?; [[ $status -ne 0 ]] && die_with_log "my_tuf.sh" "$LAST_LOG"
+
+    run_step "Switching back to '${original_branch}'" git checkout "${original_branch}"
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout ${original_branch}" "$LAST_LOG"
+
+    build_fleet
+
+    echo ""
+    info "TUF build complete. Back on branch '$(git rev-parse --abbrev-ref HEAD)'."
+}
+
+show_help() {
+    cat <<HELP_EOF
+daily-update — update, rebuild, and restart the Fleet dev environment
+
+USAGE:
+  daily-update [branch] [options]
+  daily-update --tuf
+
+WHAT IT DOES (in order):
+  1. git status / git pull
+  2. Prompts for a branch to switch to (or keep the current one). If you
+     switch branches, offers to back up the current db, then offers to
+     restore a different backup — both while the old containers are still
+     up, since the backup/restore scripts need that docker network.
+  3. Spins down: Ctrl-C to the pyserver/ngrok/db tmux windows, then
+     'docker compose down'
+  4. 'make deps' (auto-retries once via NVM if it looks like a node
+     version issue), 'make generate', 'make build'
+  5. Spins back up: 'docker compose up -d', then 'fleet prepare db --dev'
+     (if that fails with a migration-looking error, offers backup, then
+     'reset' or restore-from-backup, then retries), then starts db/ngrok/
+     pyserver/watchdog in tmux window 'fleet-dev'
+
+--tuf MODE (completely separate — does not run any of the steps above,
+no docker/tmux/db involved at all):
+  1. Remembers your current branch, checks out 'main'
+  2. git pull
+  3. make deps / make generate / make build
+  4. Runs './my_tuf.sh' in the Fleet directory
+  5. Switches back to your original branch
+  6. make deps / make generate / make build again, to leave you where
+     you started
+
+ARGUMENTS:
+  branch              Optional. Branch to switch to. Skips the interactive
+                       branch prompt. If omitted, you'll be prompted (unless
+                       -d is also set, in which case it stays on the current
+                       branch). Not used in --tuf mode.
+
+OPTIONS:
+  -d, --defaults       Fully automatic — no prompts. Keeps the current
+                       branch (unless one is also given), skips db backup/
+                       restore prompts, and auto-runs 'make db-reset' if a
+                       migration failure is hit. Every step above still
+                       runs — this only skips the interactive parts.
+                       Not used in --tuf mode.
+  -s, --silent         Suppresses the raw (dimmed) command output from each
+                       step. Step announcements, warnings, and full error
+                       output on failure still print. Works in --tuf mode too.
+  -h, --help           Show this help and exit.
+  --tuf                Run the separate TUF build flow described above,
+                       instead of the normal daily-update steps.
+  --setup              Run the interactive setup wizard to (re)configure
+                       FLEET_DIR, SHARED_DIR, and BACKUP_DIR, stored in
+                       ~/.daily-update.conf. Runs automatically the first
+                       time, or if FLEET_DIR no longer looks valid — you
+                       only need this flag to reconfigure by choice (e.g.
+                       you moved the repo, or want to change SHARED_DIR).
+                       Leaving SHARED_DIR blank skips the python
+                       http.server step entirely.
+
+EXAMPLES:
+  daily-update                  Fully interactive, prompts for everything
+  daily-update my-branch        Switch to my-branch, still prompts for backups
+  daily-update -d               Fully automatic, stay on current branch
+  daily-update my-branch -d     Auto mode, but switch to my-branch first
+  daily-update -s               Normal interactive flow, quiet output
+  daily-update -d -s            Fully automatic AND quiet
+  daily-update --setup          Reconfigure FLEET_DIR/SHARED_DIR/BACKUP_DIR
+  daily-update --tuf            Run the separate TUF build flow
+  daily-update --tuf -s         TUF build flow, quiet output
+HELP_EOF
+}
+
+# --- 0. Setup ----------------------------------------------------------------
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) show_help; exit 0 ;;
+    esac
+done
+
+for arg in "$@"; do
+    case "$arg" in
+        --setup) run_setup; exit 0 ;;
+    esac
+done
+
+if ! load_config; then
+    warn "No valid config found — let's set it up. (Run 'daily-update --setup' anytime to redo this.)"
+    echo ""
+    run_setup
+fi
+
+cd "$FLEET_DIR" || { error "Could not cd to $FLEET_DIR"; exit 1; }
+
+# --tuf is a completely separate flow — see run_tuf_flow(). It runs instead
+# of, not alongside, the normal daily-update steps below, and doesn't need
+# tmux at all.
+SILENT=false
+for arg in "$@"; do
+    case "$arg" in
+        -s|--silent) SILENT=true ;;
+        --tuf) run_tuf_flow; exit 0 ;;
+    esac
+done
+
+require_tmux
+
+# Flags: -d/--defaults runs fully non-interactively (same branch, no backup,
+# auto db-reset on migration failure). -s/--silent suppresses raw command
+# output, showing only step announcements, warnings, and errors.
+AUTO_MODE=false
+target_branch=""
+for arg in "$@"; do
+    case "$arg" in
+        -d|--defaults) AUTO_MODE=true ;;
+        -s|--silent) SILENT=true ;;
+        *) target_branch="$arg" ;;
+    esac
+done
+
+# --- 1. Sync repo state -------------------------------------------------------
+
+run_step "Checking git status" git status
+status=$?; [[ $status -ne 0 ]] && die_with_log "git status" "$LAST_LOG"
+
+# Warn on uncommitted changes before we pull/checkout under them
+if [[ -n "$(git status --porcelain)" ]]; then
+    warn "You have uncommitted changes."
+    if [[ "$AUTO_MODE" == "true" ]]; then
+        info "Auto mode (-d): continuing automatically."
+    else
+        read -rp "Continue anyway? [Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn]$ ]]; then
+            error "Aborted by user due to uncommitted changes."
+            exit 1
+        fi
+    fi
+fi
+
+run_step "Pulling latest changes" git pull
+status=$?; [[ $status -ne 0 ]] && die_with_log "git pull" "$LAST_LOG"
+
+current_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
+
+# --- 2. Branch selection, and backup/restore while the old env is still up ----
+# (backup.sh/restore.sh need the docker network from the currently-running
+# containers, so this all has to happen BEFORE we spin things down.)
+
+echo ""
+echo "Current branch: ${current_branch}"
+
+if [[ -z "$target_branch" && "$AUTO_MODE" != "true" ]]; then
+    read -rp "Enter a different branch to switch to, or press Enter to stay on '${current_branch}': " target_branch
+fi
+
+if [[ -n "${target_branch}" && "${target_branch}" != "${current_branch}" ]]; then
+    run_step "Switching to branch '${target_branch}'" git checkout "${target_branch}"
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout ${target_branch}" "$LAST_LOG"
+
+    if [[ "$AUTO_MODE" == "true" ]]; then
+        info "Auto mode (-d): skipping db backup/restore prompts."
+    else
+        echo ""
+        backup_db_prompt "Switching branches — back up the current db first? Enter a filename, or press Enter to skip: "
+
+        list_available_backups
+        read -rp "Restore one of the backups above before continuing, or press Enter to keep the current db: " restore_choice
+        if [[ -n "$restore_choice" ]]; then
+            if matched=$(match_backup "$restore_choice"); then
+                restore_db "$matched"
+            else
+                warn "'${restore_choice}' doesn't match a known backup — keeping the current db."
+            fi
+        fi
+    fi
+else
+    info "Staying on '${current_branch}'"
+fi
+
+# --- 3. Spin down dev environment ----------------------------------------------
+
+info "Spinning down dev environment..."
+
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    [[ -n "$SHARED_DIR" ]] && send_ctrl_c "pyserver"
+    send_ctrl_c "ngrok"
+    send_ctrl_c "db"
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+else
+    warn "No existing tmux session '${TMUX_SESSION}' — skipping python/ngrok/db shutdown."
+fi
+
+run_step "Stopping docker compose" docker compose down
+status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose down" "$LAST_LOG"
+
+# --- 4. Build (deps/generate/build) --------------------------------------------
+
+build_fleet
+
+# --- 5. Spin dev environment back up -------------------------------------------
+
+info "Spinning dev environment back up..."
+
+run_step "Starting docker compose (detached)" docker compose up -d
+status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose up -d" "$LAST_LOG"
+
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    warn "tmux session '${TMUX_SESSION}' already existed — killing stale session first."
+    tmux kill-session -t "$TMUX_SESSION"
+fi
+
+# Run db prep in the foreground (not tmux) so we can inspect its output —
+# it's a one-shot command, unlike `serve` which runs indefinitely.
+run_step "Preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
+status=$?
+if [[ $status -ne 0 ]]; then
+    if grep -qiE 'FAIL|WARNING|missing.*migration' "$LAST_LOG"; then
+        warn "fleet prepare db --dev failed and looks migration-related (common after switching to an older branch)."
+        echo -e "${RED}--- Details ---${NC}"
+        tail -n 20 "$LAST_LOG"
+
+        if [[ "$AUTO_MODE" == "true" ]]; then
+            warn "Auto mode (-d): skipping backup and running 'make db-reset' automatically."
+            db_action="reset"
+        else
+            backup_db_prompt "Database migration failed. To back up the current db before resetting, enter a filename (or press Enter to skip): "
+            list_available_backups
+
+            db_action=""
+            while true; do
+                read -rp "Type 'reset' to reset the database, or a backup filename above to restore: " db_action
+                if [[ "$db_action" == "reset" ]]; then
+                    break
+                fi
+                if matched=$(match_backup "$db_action"); then
+                    db_action="$matched"
+                    break
+                fi
+                warn "'${db_action}' isn't 'reset' or a known backup filename. Try again."
+            done
+        fi
+
+        if [[ "$db_action" == "reset" ]]; then
+            run_step "Running make db-reset" make db-reset
+            status=$?; [[ $status -ne 0 ]] && die_with_log "make db-reset" "$LAST_LOG"
+        else
+            restore_db "$db_action"
+        fi
+
+        run_step "Retrying: preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
+        status=$?; [[ $status -ne 0 ]] && die_with_log "fleet prepare db --dev (after db ${db_action})" "$LAST_LOG"
+    else
+        die_with_log "fleet prepare db --dev" "$LAST_LOG"
+    fi
+fi
+
+tmux new-session -d -s "$TMUX_SESSION" -n db
+info "Starting db server (tmux window 'db')..."
+tmux send-keys -t "${TMUX_SESSION}:db" \
+    "$FLEET_DIR/build/fleet serve --dev --config fleet.yml --dev_license --debug --logging_debug" C-m
+
+tmux new-window -t "$TMUX_SESSION" -n ngrok
+info "Starting ngrok (tmux window 'ngrok')..."
+tmux send-keys -t "${TMUX_SESSION}:ngrok" "ngrok start local" C-m
+
+if [[ -n "$SHARED_DIR" ]]; then
+    tmux new-window -t "$TMUX_SESSION" -n pyserver
+    info "Starting python http.server in ${SHARED_DIR} (tmux window 'pyserver')..."
+    tmux send-keys -t "${TMUX_SESSION}:pyserver" "cd ${SHARED_DIR} && python3 -m http.server" C-m
+else
+    info "SHARED_DIR not configured — skipping python http.server (run 'daily-update --setup' to enable it)."
+fi
+
+write_watchdog_script
+tmux new-window -t "$TMUX_SESSION" -n watchdog
+tmux send-keys -t "${TMUX_SESSION}:watchdog" "bash '$WATCHDOG_SCRIPT'" C-m
+info "Watchdog running (tmux window 'watchdog') — alerts via macOS notification if db/ngrok/pyserver exit unexpectedly."
+
+echo ""
+info "All done! Branch: $(git rev-parse --abbrev-ref HEAD)"
+info "Dev processes are running in tmux session '${TMUX_SESSION}'."
+echo -e "${DIM}  View them:      tmux attach -t ${TMUX_SESSION}${NC}"
+echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
+echo -e "${DIM}  Detach again:   Ctrl-b then d${NC}"
