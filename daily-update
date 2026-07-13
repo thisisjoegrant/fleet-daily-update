@@ -555,6 +555,7 @@ if [[ -n "$SHARED_DIR" ]]; then
     tmux new-window -t "$TMUX_SESSION" -n pyserver
     info "Starting python http.server in ${SHARED_DIR} (tmux window 'pyserver')..."
     tmux send-keys -t "${TMUX_SESSION}:pyserver" "cd ${SHARED_DIR} && python3 -m http.server" C-m
+    pyserver_ip=$(ipconfig getifaddr en0 2>/dev/null)
 else
     info "SHARED_DIR not configured — skipping python http.server (run 'daily-update --setup' to enable it)."
 fi
@@ -567,6 +568,13 @@ info "Watchdog running (tmux window 'watchdog') — alerts via macOS notificatio
 echo ""
 info "All done! Branch: $(git rev-parse --abbrev-ref HEAD)"
 info "Dev processes are running in tmux session '${TMUX_SESSION}'."
+if [[ -n "$SHARED_DIR" ]]; then
+    if [[ -n "${pyserver_ip:-}" ]]; then
+        info "Shared folder available at ${pyserver_ip}:8000"
+    else
+        warn "Could not determine local IP (ipconfig getifaddr en0) — check the 'pyserver' window."
+    fi
+fi
 echo -e "${DIM}  View them:      tmux attach -t ${TMUX_SESSION}${NC}"
 echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
 echo -e "${DIM}  Detach again:   Ctrl-b then d${NC}"
