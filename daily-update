@@ -87,6 +87,25 @@ send_ctrl_c() {
     fi
 }
 
+# scepserver-darwin-arm64 has a confirmed race in its own SIGINT handling
+# (it uses an unbuffered channel with signal.Notify, so Ctrl-C is dropped
+# unpredictably instead of always registering) — so Ctrl-C alone isn't
+# reliable here. It has no SIGTERM handler at all, so a plain `kill`
+# (SIGTERM) hits the default OS disposition and terminates it immediately,
+# which is what this does, scoped to just this binary.
+stop_scep() {
+    if tmux_window_exists "scep"; then
+        info "Stopping 'scep' server..."
+        if pkill -f "scepserver-darwin-arm64" 2>/dev/null; then
+            sleep 1
+        else
+            warn "No running scepserver-darwin-arm64 process found to stop."
+        fi
+    else
+        warn "No 'scep' tmux window found — skipping SCEP shutdown."
+    fi
+}
+
 # Prompts for an optional backup filename and runs backup.sh if one is given.
 # backup.sh writes relative to the working directory it's run from (the
 # Fleet repo root, since that's our cwd throughout), not into BACKUP_DIR —
@@ -170,6 +189,9 @@ restore_db() {
 # i.e. it crashed/exited and the pane fell back to a plain shell.
 write_watchdog_script() {
     local expected_entries='[db]="fleet" [ngrok]="ngrok"'
+    if [[ -n "$SCEP_DIR" ]]; then
+        expected_entries="${expected_entries} [scep]=\"scepserver-darwin-arm64\""
+    fi
     if [[ -n "$SHARED_DIR" ]]; then
         expected_entries="${expected_entries} [pyserver]=\"python3\""
     fi
@@ -207,8 +229,8 @@ WATCHDOG_EOF
 }
 
 # Interactive first-run / reconfigure wizard. Writes FLEET_DIR, SHARED_DIR,
-# and BACKUP_DIR to CONFIG_FILE. SHARED_DIR can be left blank to skip the
-# python http.server step entirely.
+# BACKUP_DIR, and SCEP_DIR to CONFIG_FILE. SHARED_DIR and SCEP_DIR can both
+# be left blank to skip the python http.server / SCEP server steps entirely.
 run_setup() {
     echo "daily-update setup"
     echo "------------------"
@@ -231,10 +253,18 @@ run_setup() {
     read -rp "Db backup directory [${default_backup_dir}]: " input_backup_dir
     BACKUP_DIR="${input_backup_dir:-$default_backup_dir}"
 
+    echo ""
+    read -rp "SCEP server directory (leave blank to skip this entirely): " SCEP_DIR
+    while [[ -n "$SCEP_DIR" && ! -x "${SCEP_DIR}/scepserver-darwin-arm64" ]]; do
+        warn "No executable 'scepserver-darwin-arm64' found at '${SCEP_DIR}'."
+        read -rp "SCEP server directory (leave blank to skip this entirely): " SCEP_DIR
+    done
+
     cat > "$CONFIG_FILE" <<CONF_EOF
 FLEET_DIR="${FLEET_DIR}"
 SHARED_DIR="${SHARED_DIR}"
 BACKUP_DIR="${BACKUP_DIR}"
+SCEP_DIR="${SCEP_DIR}"
 CONF_EOF
 
     echo ""
@@ -242,16 +272,22 @@ CONF_EOF
     echo "  FLEET_DIR=${FLEET_DIR}"
     echo "  SHARED_DIR=${SHARED_DIR:-<not set — python http.server will be skipped>}"
     echo "  BACKUP_DIR=${BACKUP_DIR}"
+    echo "  SCEP_DIR=${SCEP_DIR:-<not set — SCEP server will be skipped>}"
 }
 
 # Loads CONFIG_FILE if present and FLEET_DIR in it still looks valid.
-# Returns non-zero (triggering setup) if the file is missing or FLEET_DIR
-# no longer points at a real Fleet checkout.
+# Returns non-zero (triggering setup) if the file is missing, FLEET_DIR no
+# longer points at a real Fleet checkout, or SCEP_DIR is set but no longer
+# has the scepserver binary in it. SCEP_DIR being unset/blank is valid —
+# it just means the SCEP server step is skipped.
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 1
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
     [[ -n "${FLEET_DIR:-}" && -f "${FLEET_DIR}/Makefile" ]] || return 1
+    if [[ -n "${SCEP_DIR:-}" && ! -x "${SCEP_DIR}/scepserver-darwin-arm64" ]]; then
+        return 1
+    fi
     return 0
 }
 
@@ -330,17 +366,18 @@ WHAT IT DOES (in order):
      switch branches, offers to back up the current db, then offers to
      restore a different backup — both while the old containers are still
      up, since the backup/restore scripts need that docker network.
-  3. Spins down: Ctrl-C to the pyserver/ngrok/db tmux windows, then
-     'docker compose down'
+  3. Spins down: stops the SCEP server (if configured), Ctrl-C to the
+     pyserver/ngrok/db tmux windows, then 'docker compose down'
   4. 'make deps' (auto-retries once via NVM if it looks like a node
      version issue), 'make generate', 'make build'
   5. Spins back up: 'docker compose up -d', then 'fleet prepare db --dev'
      (if that fails with a migration-looking error, offers backup, then
      'reset' or restore-from-backup, then retries), then starts db/ngrok/
-     pyserver/watchdog in tmux window 'fleet-dev'
+     pyserver (if configured)/scep (if configured)/watchdog in tmux window
+     'fleet-dev'
 
 --tuf MODE (completely separate — does not run any of the steps above,
-no docker/tmux/db involved at all):
+no docker/tmux/db/scep involved at all):
   1. Remembers your current branch, checks out 'main'
   2. git pull
   3. make deps / make generate / make build
@@ -369,13 +406,14 @@ OPTIONS:
   --tuf                Run the separate TUF build flow described above,
                        instead of the normal daily-update steps.
   --setup              Run the interactive setup wizard to (re)configure
-                       FLEET_DIR, SHARED_DIR, and BACKUP_DIR, stored in
-                       ~/.daily-update.conf. Runs automatically the first
-                       time, or if FLEET_DIR no longer looks valid — you
+                       FLEET_DIR, SHARED_DIR, BACKUP_DIR, and SCEP_DIR,
+                       stored in ~/.daily-update.conf. Runs automatically
+                       the first time, or if FLEET_DIR no longer looks
+                       valid, or SCEP_DIR is set but no longer valid — you
                        only need this flag to reconfigure by choice (e.g.
-                       you moved the repo, or want to change SHARED_DIR).
-                       Leaving SHARED_DIR blank skips the python
-                       http.server step entirely.
+                       you moved a directory, or want to change SHARED_DIR).
+                       Leaving SHARED_DIR or SCEP_DIR blank skips the python
+                       http.server / SCEP server steps entirely.
 
 EXAMPLES:
   daily-update                  Fully interactive, prompts for everything
@@ -517,12 +555,13 @@ fi
 info "Spinning down dev environment..."
 
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    [[ -n "$SCEP_DIR" ]] && stop_scep
     [[ -n "$SHARED_DIR" ]] && send_ctrl_c "pyserver"
     send_ctrl_c "ngrok"
     send_ctrl_c "db"
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 else
-    warn "No existing tmux session '${TMUX_SESSION}' — skipping python/ngrok/db shutdown."
+    warn "No existing tmux session '${TMUX_SESSION}' — skipping scep/python/ngrok/db shutdown."
 fi
 
 run_step "Stopping docker compose" docker compose down
@@ -607,10 +646,28 @@ else
     info "SHARED_DIR not configured — skipping python http.server (run 'daily-update --setup' to enable it)."
 fi
 
+if [[ -n "$SCEP_DIR" ]]; then
+    tmux new-window -t "$TMUX_SESSION" -n scep
+    info "Starting SCEP server (tmux window 'scep')..."
+    tmux send-keys -t "${TMUX_SESSION}:scep" \
+        "cd ${SCEP_DIR} && ./scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0" C-m
+    sleep 2
+    scep_current=$(tmux list-panes -t "${TMUX_SESSION}:scep" -F '#{pane_current_command}' 2>/dev/null | head -n1)
+    if [[ "$scep_current" == "scepserver-darwin-arm64" ]]; then
+        info "SCEP server started successfully."
+    else
+        warn "SCEP server may have failed to start — pane is running '${scep_current}' instead of scepserver-darwin-arm64."
+        echo -e "${RED}--- scep window output ---${NC}"
+        tmux capture-pane -p -t "${TMUX_SESSION}:scep" | tail -n 20
+    fi
+else
+    info "SCEP_DIR not configured — skipping SCEP server (run 'daily-update --setup' to enable it)."
+fi
+
 write_watchdog_script
 tmux new-window -t "$TMUX_SESSION" -n watchdog
 tmux send-keys -t "${TMUX_SESSION}:watchdog" "bash '$WATCHDOG_SCRIPT'" C-m
-info "Watchdog running (tmux window 'watchdog') — alerts via macOS notification if db/ngrok/pyserver exit unexpectedly."
+info "Watchdog running (tmux window 'watchdog') — alerts via macOS notification if db/ngrok$( [[ -n "$SCEP_DIR" ]] && echo '/scep')$( [[ -n "$SHARED_DIR" ]] && echo '/pyserver') exit unexpectedly."
 
 echo ""
 info "All done! Branch: $(git rev-parse --abbrev-ref HEAD)"
@@ -623,5 +680,5 @@ if [[ -n "$SHARED_DIR" ]]; then
     fi
 fi
 echo -e "${DIM}  View them:      tmux attach -t ${TMUX_SESSION}${NC}"
-echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
+echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SCEP_DIR" ]] && echo ', scep')$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
 echo -e "${DIM}  Detach again:   Ctrl-b then d${NC}"
