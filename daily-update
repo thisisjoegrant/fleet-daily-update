@@ -232,11 +232,14 @@ while tmux has-session -t "\$SESSION" 2>/dev/null; do
         if tmux list-windows -t "\$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "\$window"; then
             current=\$(tmux list-panes -t "\${SESSION}:\${window}" -F '#{pane_current_command}' 2>/dev/null | head -n1)
             expected="\${EXPECTED[\$window]}"
-            if [[ -n "\$current" && "\$current" != "\$expected" && -z "\${ALERTED[\$window]:-}" ]]; then
+            # tmux truncates pane_current_command to 15 chars, so a full
+            # process name like scepserver-darwin-arm64 comes back
+            # shortened. Compare as a prefix match, not an exact one.
+            if [[ -n "\$current" && "\$expected" == "\${current}"* ]]; then
+                ALERTED[\$window]=""
+            elif [[ -n "\$current" && -z "\${ALERTED[\$window]:-}" ]]; then
                 notify "'\${window}' exited unexpectedly (expected '\${expected}', now '\${current}')"
                 ALERTED[\$window]=1
-            elif [[ "\$current" == "\$expected" ]]; then
-                ALERTED[\$window]=""
             fi
         fi
     done
@@ -682,7 +685,10 @@ if [[ -n "$SCEP_DIR" ]]; then
         "cd ${SCEP_DIR} && ./scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0" C-m
     sleep 2
     scep_current=$(tmux list-panes -t "${TMUX_SESSION}:scep" -F '#{pane_current_command}' 2>/dev/null | head -n1)
-    if [[ "$scep_current" == "scepserver-darwin-arm64" ]]; then
+    # tmux truncates pane_current_command to 15 chars, so compare as a
+    # prefix rather than an exact match (e.g. "scepserver-darw" is a valid
+    # truncation of "scepserver-darwin-arm64", not a different process).
+    if [[ -n "$scep_current" && "scepserver-darwin-arm64" == "${scep_current}"* ]]; then
         info "SCEP server started successfully."
     else
         warn "SCEP server may have failed to start — pane is running '${scep_current}' instead of scepserver-darwin-arm64."
