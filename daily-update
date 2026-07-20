@@ -482,6 +482,12 @@ if ! load_config; then
     run_setup
 fi
 
+# Defends against an older ~/.daily-update.conf written before SHARED_DIR or
+# SCEP_DIR existed as config options — without this, referencing an unset
+# (not just empty) variable would error out under `set -u`.
+SHARED_DIR="${SHARED_DIR:-}"
+SCEP_DIR="${SCEP_DIR:-}"
+
 cd "$FLEET_DIR" || { error "Could not cd to $FLEET_DIR"; exit 1; }
 
 # --tuf is a completely separate flow — see run_tuf_flow(). It runs instead
