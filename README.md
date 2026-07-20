@@ -21,6 +21,8 @@ Running `daily-update` with no flags does all of the following, in order:
 3. **Spin down.** Stops the SCEP server if configured (see below for why
    this isn't a simple Ctrl-C), sends Ctrl-C into the `pyserver`, `ngrok`,
    and `db` tmux windows (in that order), then runs `docker compose down`.
+   If Docker Desktop isn't running at this point, it's launched
+   automatically and the script waits for it before continuing (see below).
 4. **Build.** `make deps` (auto-retries once via NVM if the failure looks
    like a node version mismatch), then `make generate`, then `make build`.
 5. **Spin back up.**
@@ -261,6 +263,21 @@ termination) — reliable every time. `daily-update` automates exactly that:
 `pkill -f scepserver-darwin-arm64`, scoped tightly to that binary name so it
 can't affect anything else running on your machine.
 
+## Docker Desktop auto-start
+
+Before either `docker compose down` or `docker compose up -d`, `daily-update`
+checks whether the Docker daemon is actually responding (`docker info`). If
+it isn't, it runs `open -a Docker` to launch Docker Desktop, then polls every
+2 seconds — up to 90 seconds total — until the daemon comes up before
+continuing. If it still hasn't started after 90 seconds, the script stops
+with a clear message instead of letting the next docker command fail with a
+confusing connection error.
+
+This assumes Docker Desktop is installed at its default location
+(`/Applications/Docker.app`, launched via the name "Docker") — a non-default
+install location or a renamed app wouldn't be found by `open -a Docker`,
+though you'd still get a clear timeout message rather than a silent hang.
+
 ## Tmux session
 
 Everything long-running lives in a tmux session named `fleet-dev`:
@@ -304,3 +321,5 @@ tmux attach -t fleet-dev     # view any window
 - SCEP shutdown assumes the binary is exactly named `scepserver-darwin-arm64`
   and that no other unrelated process on your machine matches that name —
   `pkill -f` is scoped to that string specifically to keep this safe.
+- Docker Desktop auto-start assumes it's installed at the default location
+  and named "Docker" — see the Docker Desktop auto-start section above.

@@ -72,6 +72,25 @@ require_tmux() {
     command -v tmux >/dev/null 2>&1 || die_with_log "tmux is required for this script. Install it with: brew install tmux" /dev/null
 }
 
+# Starts Docker Desktop if the daemon isn't responding, and waits (up to
+# ~90s) for it to actually come up before continuing.
+ensure_docker_running() {
+    docker info >/dev/null 2>&1 && return 0
+
+    warn "Docker daemon isn't running — launching Docker Desktop..."
+    open -a Docker 2>/dev/null
+
+    local waited=0 max_wait=90
+    while ! docker info >/dev/null 2>&1; do
+        sleep 2
+        waited=$((waited + 2))
+        if [[ $waited -ge $max_wait ]]; then
+            die_with_log "Docker Desktop didn't finish starting within ${max_wait}s — check it manually and re-run." /dev/null
+        fi
+    done
+    info "Docker is up."
+}
+
 tmux_window_exists() {
     tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$1"
 }
@@ -564,6 +583,8 @@ else
     warn "No existing tmux session '${TMUX_SESSION}' — skipping scep/python/ngrok/db shutdown."
 fi
 
+ensure_docker_running
+
 run_step "Stopping docker compose" docker compose down
 status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose down" "$LAST_LOG"
 
@@ -574,6 +595,8 @@ build_fleet
 # --- 5. Spin dev environment back up -------------------------------------------
 
 info "Spinning dev environment back up..."
+
+ensure_docker_running
 
 run_step "Starting docker compose (detached)" docker compose up -d
 status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose up -d" "$LAST_LOG"
