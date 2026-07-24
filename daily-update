@@ -682,10 +682,13 @@ if [[ $status -ne 0 ]]; then
         # like a renumbered-migration conflict before deciding what to do.
         cleanup_branch=$(git rev-parse --abbrev-ref HEAD)
         migration_cleanup_dry_run "$cleanup_branch"
+        dry_run_status=$?
         cleanup_found=false
-        if [[ $? -eq 0 ]] && grep -qE 'Found [1-9][0-9]* migration renumber' "$LAST_LOG"; then
+        if [[ $dry_run_status -eq 0 ]] && grep -q "Dry-run: SQL will apply cleanly." "$LAST_LOG"; then
             cleanup_found=true
-            info "migration-cleanup found renumbered migrations on '${cleanup_branch}' — likely cause (see output above)."
+            info "migration-cleanup found renumbered migrations on '${cleanup_branch}' and reports a clean fix (see output above)."
+        elif grep -qE 'Found [1-9][0-9]* migration renumber' "$LAST_LOG"; then
+            warn "migration-cleanup found renumbered migrations on '${cleanup_branch}', but reported issues (dry-run exit ${dry_run_status}) rather than a clean fix. Not recommending it automatically — review the output above if you want to try it manually anyway."
         fi
 
         if [[ "$AUTO_MODE" == "true" ]]; then
