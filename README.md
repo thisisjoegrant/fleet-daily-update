@@ -105,8 +105,12 @@ Separate from the normal flow — no docker/tmux/db/scep involved:
 
 On a branch switch, and on a migration-looking `fleet prepare db --dev`
 failure, you can back up (type a name, `.sql.gz` added automatically) and/or
-restore an existing backup (listed by name) or `reset` (`make db-reset`).
-Typing `reset` requires a second `YES` confirmation.
+restore an existing backup (listed by name), `reset` (`make db-reset`), or
+`cleanup` — runs `tools/migration-cleanup` for a renumbered-migration
+conflict (fixes Fleet's migration bookkeeping, not your data), defaulting to
+your current branch, dry-run shown before a required `YES` to apply. `reset`
+also requires `YES`. None of this is available in `-d` mode except the
+mandatory pre-reset backup.
 
 Backups are verified, not just assumed — the script confirms the file
 actually exists in `BACKUP_DIR` (relocating it there if `backup.sh` wrote to

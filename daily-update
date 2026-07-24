@@ -213,6 +213,28 @@ restore_db() {
     [[ $status -ne 0 ]] && die_with_log "db restore (${file})" "$LAST_LOG"
 }
 
+# Runs tools/migration-cleanup for a renumbered-migration conflict: dry-run
+# first (shown in full), then requires a YES confirmation before --apply.
+# Fixes Fleet's migration bookkeeping tables, not the actual data — an
+# alternative to reset/restore for this specific failure shape.
+run_migration_cleanup() {
+    local rc_branch default_branch
+    default_branch="${target_branch:-$(git rev-parse --abbrev-ref HEAD)}"
+    read -rp "Branch to compare against main for renumbered migrations (press Enter to use current branch, ${default_branch}): " rc_branch
+    rc_branch="${rc_branch:-$default_branch}"
+
+    run_step "migration-cleanup dry-run (${rc_branch})" go run ./tools/migration-cleanup -b "$rc_branch" --dry-run --config fleet.yml
+    status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup dry-run" "$LAST_LOG"
+
+    read -rp "Apply the migration-cleanup SQL shown above? Type YES to confirm: " cleanup_confirm
+    if [[ "$cleanup_confirm" != "YES" ]]; then
+        die_with_log "migration-cleanup (declined apply)" /dev/null
+    fi
+
+    run_step "migration-cleanup apply (${rc_branch})" go run ./tools/migration-cleanup -b "$rc_branch" --apply --config fleet.yml
+    status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup apply" "$LAST_LOG"
+}
+
 # Writes a standalone script that polls db/ngrok/scep/pyserver and alerts
 # (macOS notification) if one crashes.
 write_watchdog_script() {
@@ -641,7 +663,7 @@ if [[ $status -ne 0 ]]; then
 
             db_action=""
             while true; do
-                read -rp "Type 'reset' to reset the database, or a backup filename above to restore: " db_action
+                read -rp "Type 'reset' to reset the database, 'cleanup' to run migration-cleanup, or a backup filename above to restore: " db_action
                 if [[ "$db_action" == "reset" ]]; then
                     read -rp "This permanently erases the current dev database. Type YES to confirm: " reset_confirm
                     if [[ "$reset_confirm" == "YES" ]]; then
@@ -651,17 +673,22 @@ if [[ $status -ne 0 ]]; then
                     db_action=""
                     continue
                 fi
+                if [[ "$db_action" == "cleanup" ]]; then
+                    break
+                fi
                 if matched=$(match_backup "$db_action"); then
                     db_action="$matched"
                     break
                 fi
-                warn "'${db_action}' isn't 'reset' or a known backup filename. Try again."
+                warn "'${db_action}' isn't 'reset', 'cleanup', or a known backup filename. Try again."
             done
         fi
 
         if [[ "$db_action" == "reset" ]]; then
             run_step "Running make db-reset" make db-reset
             status=$?; [[ $status -ne 0 ]] && die_with_log "make db-reset" "$LAST_LOG"
+        elif [[ "$db_action" == "cleanup" ]]; then
+            run_migration_cleanup
         else
             restore_db "$db_action"
         fi
