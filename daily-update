@@ -2,9 +2,8 @@
 set -uo pipefail
 
 # --- Config -----------------------------------------------------------------
-# FLEET_DIR / SHARED_DIR / BACKUP_DIR live in a small config file, not here,
-# so you don't have to re-edit the script itself when a path changes — see
-# run_setup() below. Run `daily-update --setup` to (re)configure them.
+# FLEET_DIR / SHARED_DIR / BACKUP_DIR / SCEP_DIR live in ~/.daily-update.conf,
+# not here — see run_setup() below, or run `daily-update --setup`.
 
 CONFIG_FILE="$HOME/.daily-update.conf"
 TMUX_SESSION="fleet-dev"
@@ -30,13 +29,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Runs a command, streams its output live (dimmed, to visually separate it
-# from our own info/warn/error lines), and logs it to a temp file so the
-# real error text can be shown/inspected if the command fails.
-#
-# Usage: run_step "description" cmd arg1 arg2 ...
-# Sets: LAST_LOG (path to the full captured output of the most recent call)
-# Returns: the command's real exit status (does NOT exit on failure)
+# Runs a command, streams dimmed output live, logs it for error display.
+# Usage: run_step "description" cmd args...
+# Sets LAST_LOG; returns the command's exit status (doesn't exit on failure).
 run_step() {
     local desc="$1"; shift
     local logfile rcfile status
@@ -72,8 +67,7 @@ require_tmux() {
     command -v tmux >/dev/null 2>&1 || die_with_log "tmux is required for this script. Install it with: brew install tmux" /dev/null
 }
 
-# Starts Docker Desktop if the daemon isn't responding, and waits (up to
-# ~90s) for it to actually come up before continuing.
+# Launches Docker Desktop if the daemon isn't up, and waits up to ~90s.
 ensure_docker_running() {
     docker info >/dev/null 2>&1 && return 0
 
@@ -91,10 +85,8 @@ ensure_docker_running() {
     info "Docker is up."
 }
 
-# Runs a docker compose subcommand, retrying once after a short pause if it
-# fails. Docker's daemon can respond to `docker info` before its internal
-# networking is fully ready, so a transient failure right after
-# ensure_docker_running is possible even though the daemon itself answered.
+# Runs a docker compose subcommand, retrying once — the daemon can answer
+# `docker info` before its networking is fully ready.
 run_docker_compose() {
     local desc="$1"; shift
     run_step "$desc" docker compose "$@"
@@ -123,12 +115,9 @@ send_ctrl_c() {
     fi
 }
 
-# scepserver-darwin-arm64 has a confirmed race in its own SIGINT handling
-# (it uses an unbuffered channel with signal.Notify, so Ctrl-C is dropped
-# unpredictably instead of always registering) — so Ctrl-C alone isn't
-# reliable here. It has no SIGTERM handler at all, so a plain `kill`
-# (SIGTERM) hits the default OS disposition and terminates it immediately,
-# which is what this does, scoped to just this binary.
+# scepserver-darwin-arm64 has a known SIGINT race (unbuffered signal.Notify
+# channel) so Ctrl-C is unreliable. No SIGTERM handler exists, so a plain
+# kill terminates it cleanly every time.
 stop_scep() {
     if tmux_window_exists "scep"; then
         info "Stopping 'scep' server..."
@@ -142,15 +131,9 @@ stop_scep() {
     fi
 }
 
-# Runs backup.sh for a given name and relocates the file into BACKUP_DIR
-# (backup.sh writes relative to the Fleet repo root, not into BACKUP_DIR —
-# see the comment on backup_db_prompt below). No prompting involved, so
-# this is safe to call automatically (e.g. in -d/auto mode).
-#
-# Treats any failure to confirm the backup landed in BACKUP_DIR as fatal —
-# a caller further up the chain may be about to run a destructive db
-# operation on the strength of this backup existing, so silently continuing
-# without one is not acceptable.
+# Runs backup.sh and relocates the result into BACKUP_DIR (backup.sh writes
+# relative to the repo root, not BACKUP_DIR). Any failure to confirm the
+# backup landed is fatal — callers may rely on it before a destructive op.
 run_db_backup() {
     local backup_name="$1"
     backup_name="${backup_name%.sql.gz}.sql.gz"
@@ -177,15 +160,13 @@ run_db_backup() {
     fi
 }
 
-# Prompts for an optional backup filename and runs run_db_backup if one is
-# given.
 backup_db_prompt() {
     local prompt="$1" backup_name
     read -rp "$prompt" backup_name
     [[ -n "$backup_name" ]] && run_db_backup "$backup_name"
 }
 
-# Populates the global `available_backups` array and prints it.
+# Populates and prints the global `available_backups` array.
 list_available_backups() {
     available_backups=()
     while IFS= read -r f; do
@@ -200,8 +181,7 @@ list_available_backups() {
     fi
 }
 
-# Matches user input against `available_backups`, with or without .sql.gz suffix.
-# Prints the matched filename, or nothing if no match.
+# Matches input against available_backups (with/without .sql.gz); prints match.
 match_backup() {
     local input="$1" b
     for b in "${available_backups[@]}"; do
@@ -213,10 +193,8 @@ match_backup() {
     return 1
 }
 
-# restore.sh presumably reads relative to the working directory the same
-# way backup.sh writes to it (unconfirmed, but symmetric behavior is the
-# reasonable assumption) — so stage a copy into the repo root first, and
-# clean it up afterward, leaving the canonical copy in BACKUP_DIR untouched.
+# Stages a copy into the repo root for restore.sh (mirrors backup.sh's cwd
+# behavior), cleans up after, and verifies the stage before proceeding.
 restore_db() {
     local file="$1" staged=false
     if [[ -f "${BACKUP_DIR}/${file}" && "${FLEET_DIR}" != "${BACKUP_DIR}" ]]; then
@@ -235,10 +213,8 @@ restore_db() {
     [[ $status -ne 0 ]] && die_with_log "db restore (${file})" "$LAST_LOG"
 }
 
-# Writes a small standalone script that polls the db/ngrok/pyserver tmux
-# windows and fires a macOS notification (+ a log line inside its own tmux
-# window) if the process running in one of them changes unexpectedly —
-# i.e. it crashed/exited and the pane fell back to a plain shell.
+# Writes a standalone script that polls db/ngrok/scep/pyserver and alerts
+# (macOS notification) if one crashes.
 write_watchdog_script() {
     local expected_entries='[db]="fleet" [ngrok]="ngrok"'
     if [[ -n "$SCEP_DIR" ]]; then
@@ -260,9 +236,7 @@ notify() {
     echo "[\$(date '+%H:%M:%S')] \${msg}"
 }
 
-# Grace period before the first check — a just-started process can briefly
-# still show as the parent shell in pane_current_command, which would
-# otherwise look like an immediate false-positive crash.
+# Grace period so a just-started process isn't mistaken for a crash.
 sleep 5
 
 while tmux has-session -t "\$SESSION" 2>/dev/null; do
@@ -270,9 +244,7 @@ while tmux has-session -t "\$SESSION" 2>/dev/null; do
         if tmux list-windows -t "\$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "\$window"; then
             current=\$(tmux list-panes -t "\${SESSION}:\${window}" -F '#{pane_current_command}' 2>/dev/null | head -n1)
             expected="\${EXPECTED[\$window]}"
-            # tmux truncates pane_current_command to 15 chars, so a full
-            # process name like scepserver-darwin-arm64 comes back
-            # shortened. Compare as a prefix match, not an exact one.
+            # tmux truncates pane_current_command to 15 chars; compare as a prefix.
             if [[ -n "\$current" && "\$expected" == "\${current}"* ]]; then
                 ALERTED[\$window]=""
             elif [[ -n "\$current" && -z "\${ALERTED[\$window]:-}" ]]; then
@@ -288,9 +260,8 @@ WATCHDOG_EOF
     chmod +x "$WATCHDOG_SCRIPT"
 }
 
-# Interactive first-run / reconfigure wizard. Writes FLEET_DIR, SHARED_DIR,
-# BACKUP_DIR, and SCEP_DIR to CONFIG_FILE. SHARED_DIR and SCEP_DIR can both
-# be left blank to skip the python http.server / SCEP server steps entirely.
+# Interactive first-run / reconfigure wizard. SHARED_DIR and SCEP_DIR can
+# be left blank to skip those steps entirely.
 run_setup() {
     echo "daily-update setup"
     echo "------------------"
@@ -335,11 +306,8 @@ CONF_EOF
     echo "  SCEP_DIR=${SCEP_DIR:-<not set — SCEP server will be skipped>}"
 }
 
-# Loads CONFIG_FILE if present and FLEET_DIR in it still looks valid.
-# Returns non-zero (triggering setup) if the file is missing, FLEET_DIR no
-# longer points at a real Fleet checkout, or SCEP_DIR is set but no longer
-# has the scepserver binary in it. SCEP_DIR being unset/blank is valid —
-# it just means the SCEP server step is skipped.
+# Loads CONFIG_FILE; returns non-zero (triggering setup) if missing, if
+# FLEET_DIR is invalid, or if a non-blank SCEP_DIR lacks the binary.
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 1
     # shellcheck disable=SC1090
@@ -357,8 +325,7 @@ build_fleet() {
     run_step "Running make deps" make deps
     status=$?
     if [[ $status -ne 0 ]]; then
-        # Only take the NVM detour if the failure actually looks version-related,
-        # rather than blindly retrying every failure that way.
+        # Only take the NVM detour if it actually looks version-related.
         if grep -qi 'nvm' "$LAST_LOG" || { grep -qi 'node' "$LAST_LOG" && grep -qiE 'version|engine|incompatible' "$LAST_LOG"; }; then
             warn "make deps failed and looks like an NVM/node version issue. Retrying via NVM..."
             if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
@@ -384,9 +351,8 @@ build_fleet() {
     status=$?; [[ $status -ne 0 ]] && die_with_log "make build" "$LAST_LOG"
 }
 
-# --tuf mode: an entirely separate flow from the normal daily-update steps.
-# Builds main on top of a TUF server, then returns you to whatever branch
-# you started on and rebuilds that too. Does not touch docker/tmux/db at all.
+# --tuf mode: separate from the normal flow. Builds main via the TUF
+# server, then returns to your original branch and rebuilds that too.
 run_tuf_flow() {
     local original_branch
     original_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
@@ -532,17 +498,13 @@ if ! load_config; then
     run_setup
 fi
 
-# Defends against an older ~/.daily-update.conf written before SHARED_DIR or
-# SCEP_DIR existed as config options — without this, referencing an unset
-# (not just empty) variable would error out under `set -u`.
+# Defends against an older config file predating these options.
 SHARED_DIR="${SHARED_DIR:-}"
 SCEP_DIR="${SCEP_DIR:-}"
 
 cd "$FLEET_DIR" || { error "Could not cd to $FLEET_DIR"; exit 1; }
 
-# --tuf is a completely separate flow — see run_tuf_flow(). It runs instead
-# of, not alongside, the normal daily-update steps below, and doesn't need
-# tmux at all.
+# --tuf runs instead of, not alongside, the normal flow — see run_tuf_flow().
 SILENT=false
 for arg in "$@"; do
     case "$arg" in
@@ -591,8 +553,7 @@ status=$?; [[ $status -ne 0 ]] && die_with_log "git pull" "$LAST_LOG"
 current_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
 
 # --- 2. Branch selection, and backup/restore while the old env is still up ----
-# (backup.sh/restore.sh need the docker network from the currently-running
-# containers, so this all has to happen BEFORE we spin things down.)
+# (must happen before spin-down — backup.sh/restore.sh need the live docker network)
 
 echo ""
 echo "Current branch: ${current_branch}"
@@ -660,8 +621,7 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
-# Run db prep in the foreground (not tmux) so we can inspect its output —
-# it's a one-shot command, unlike `serve` which runs indefinitely.
+# Foreground, not tmux — one-shot command, unlike `serve` which runs forever.
 run_step "Preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
 status=$?
 if [[ $status -ne 0 ]]; then
