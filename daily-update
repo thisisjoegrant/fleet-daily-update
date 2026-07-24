@@ -27,7 +27,9 @@ cleanup() {
         [[ -f "$f" ]] && rm -f "$f"
     done
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Runs a command, streams dimmed output live, logs it for error display.
 # Usage: run_step "description" cmd args...
