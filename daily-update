@@ -214,25 +214,19 @@ restore_db() {
     [[ $status -ne 0 ]] && die_with_log "db restore (${file})" "$LAST_LOG"
 }
 
-# Runs tools/migration-cleanup for a renumbered-migration conflict: dry-run
-# first (shown in full), then requires a YES confirmation before --apply.
-# Fixes Fleet's migration bookkeeping tables, not the actual data — an
-# alternative to reset/restore for this specific failure shape.
-run_migration_cleanup() {
-    local rc_branch default_branch
-    default_branch="${target_branch:-$(git rev-parse --abbrev-ref HEAD)}"
-    read -rp "Branch to compare against main for renumbered migrations (press Enter to use current branch, ${default_branch}): " rc_branch
-    rc_branch="${rc_branch:-$default_branch}"
+# Runs tools/migration-cleanup --dry-run against $1 (branch). Read-only —
+# safe to run automatically. Sets LAST_LOG; returns its exit status.
+migration_cleanup_dry_run() {
+    local branch="$1"
+    run_step "Checking migration-cleanup (dry-run, ${branch})" go run ./tools/migration-cleanup -b "$branch" --dry-run --config fleet.yml
+    return $?
+}
 
-    run_step "migration-cleanup dry-run (${rc_branch})" go run ./tools/migration-cleanup -b "$rc_branch" --dry-run --config fleet.yml
-    status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup dry-run" "$LAST_LOG"
-
-    read -rp "Apply the migration-cleanup SQL shown above? Type YES to confirm: " cleanup_confirm
-    if [[ "$cleanup_confirm" != "YES" ]]; then
-        die_with_log "migration-cleanup (declined apply)" /dev/null
-    fi
-
-    run_step "migration-cleanup apply (${rc_branch})" go run ./tools/migration-cleanup -b "$rc_branch" --apply --config fleet.yml
+# Applies migration-cleanup for $1 (branch). Fixes Fleet's migration
+# bookkeeping tables, not the actual data. Dies on failure.
+migration_cleanup_apply() {
+    local branch="$1"
+    run_step "migration-cleanup apply (${branch})" go run ./tools/migration-cleanup -b "$branch" --apply --config fleet.yml
     status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup apply" "$LAST_LOG"
 }
 
@@ -653,22 +647,44 @@ run_step "Preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
 status=$?
 if [[ $status -ne 0 ]]; then
     if grep -qiE 'FAIL|WARNING|missing.*migration' "$LAST_LOG"; then
-        warn "fleet prepare db --dev failed and looks migration-related (common after switching to an older branch)."
+        warn "fleet prepare db --dev failed and looks migration-related (common after switching to an older branch, or after pulling renumbered migrations)."
         echo -e "${RED}--- Details ---${NC}"
         tail -n 20 "$LAST_LOG"
 
+        # Dry-run is read-only, so check automatically whether this looks
+        # like a renumbered-migration conflict before deciding what to do.
+        cleanup_branch=$(git rev-parse --abbrev-ref HEAD)
+        migration_cleanup_dry_run "$cleanup_branch"
+        cleanup_found=false
+        if [[ $? -eq 0 ]] && grep -qE 'Found [1-9][0-9]* migration renumber' "$LAST_LOG"; then
+            cleanup_found=true
+            info "migration-cleanup found renumbered migrations on '${cleanup_branch}' — likely cause (see output above)."
+        fi
+
         if [[ "$AUTO_MODE" == "true" ]]; then
             auto_backup_name="autobackup-$(date +%Y%m%d-%H%M%S)"
-            warn "Auto mode (-d): backing up db to ${auto_backup_name}.sql.gz before resetting (this step is not skippable)."
+            warn "Auto mode (-d): backing up db to ${auto_backup_name}.sql.gz before attempting a fix (this step is not skippable)."
             run_db_backup "$auto_backup_name"
-            db_action="reset"
+
+            if [[ "$cleanup_found" == "true" ]]; then
+                warn "Auto mode (-d): applying migration-cleanup automatically (less destructive than a full reset)."
+                migration_cleanup_apply "$cleanup_branch"
+                db_action="cleanup"
+            else
+                warn "Auto mode (-d): migration-cleanup not applicable — running 'make db-reset' instead."
+                db_action="reset"
+            fi
         else
-            backup_db_prompt "Database migration failed. To back up the current db before resetting, enter a filename (or press Enter to skip): "
+            backup_db_prompt "Back up the current db before continuing? Enter a filename (or press Enter to skip): "
             list_available_backups
 
             db_action=""
             while true; do
-                read -rp "Type 'reset' to reset the database, 'cleanup' to run migration-cleanup, or a backup filename above to restore: " db_action
+                if [[ "$cleanup_found" == "true" ]]; then
+                    read -rp "Type 'cleanup' (recommended — see above) to apply the fix, 'reset' to reset the database, or a backup filename above to restore: " db_action
+                else
+                    read -rp "Type 'reset' to reset the database, 'cleanup' to try migration-cleanup manually, or a backup filename above to restore: " db_action
+                fi
                 if [[ "$db_action" == "reset" ]]; then
                     read -rp "This permanently erases the current dev database. Type YES to confirm: " reset_confirm
                     if [[ "$reset_confirm" == "YES" ]]; then
@@ -693,7 +709,19 @@ if [[ $status -ne 0 ]]; then
             run_step "Running make db-reset" make db-reset
             status=$?; [[ $status -ne 0 ]] && die_with_log "make db-reset" "$LAST_LOG"
         elif [[ "$db_action" == "cleanup" ]]; then
-            run_migration_cleanup
+            if [[ "$AUTO_MODE" != "true" ]]; then
+                if [[ "$cleanup_found" != "true" ]]; then
+                    read -rp "Branch to compare against main for renumbered migrations (press Enter to use current branch, ${cleanup_branch}): " manual_branch
+                    cleanup_branch="${manual_branch:-$cleanup_branch}"
+                    migration_cleanup_dry_run "$cleanup_branch"
+                    status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup dry-run" "$LAST_LOG"
+                fi
+                read -rp "Apply the migration-cleanup SQL shown above? Type YES to confirm: " cleanup_confirm
+                if [[ "$cleanup_confirm" != "YES" ]]; then
+                    die_with_log "migration-cleanup (declined apply)" /dev/null
+                fi
+                migration_cleanup_apply "$cleanup_branch"
+            fi
         else
             restore_db "$db_action"
         fi

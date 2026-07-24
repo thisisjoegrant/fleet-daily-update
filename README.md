@@ -17,8 +17,9 @@ order — plus a separate `--tuf` build mode.
 4. `make deps` (auto-retries via NVM on a node-version failure) → `make
    generate` → `make build`.
 5. Spin up: `docker compose up -d` → `fleet prepare db --dev` (on a
-   migration-looking failure: backup, then `reset` or restore, then
-   retries) → starts db/ngrok/pyserver/scep/watchdog in tmux.
+   migration-looking failure: auto-checks `migration-cleanup` first, then
+   backup, then `cleanup`/`reset`/restore, then retries) → starts
+   db/ngrok/pyserver/scep/watchdog in tmux.
 
 ## Prerequisites
 
@@ -103,14 +104,16 @@ Separate from the normal flow — no docker/tmux/db/scep involved:
 
 ## Db backup & restore
 
-On a branch switch, and on a migration-looking `fleet prepare db --dev`
-failure, you can back up (type a name, `.sql.gz` added automatically) and/or
-restore an existing backup (listed by name), `reset` (`make db-reset`), or
-`cleanup` — runs `tools/migration-cleanup` for a renumbered-migration
-conflict (fixes Fleet's migration bookkeeping, not your data), defaulting to
-your current branch, dry-run shown before a required `YES` to apply. `reset`
-also requires `YES`. None of this is available in `-d` mode except the
-mandatory pre-reset backup.
+On a branch switch, you're offered a db backup and/or restore before
+continuing (same backup/restore mechanics as below).
+
+On a migration-looking `fleet prepare db --dev` failure, a `migration-cleanup
+--dry-run` (read-only) runs automatically against your current branch first.
+If it finds renumbered migrations, `cleanup` is offered as the recommended
+fix — applying still requires `YES`. If not, you fall back to backup +
+`reset` (also requires `YES`) or restore. In `-d` mode, `cleanup` applies
+automatically when found (after a mandatory backup); otherwise it falls
+back to `make db-reset`, same mandatory backup, no other prompts.
 
 Backups are verified, not just assumed — the script confirms the file
 actually exists in `BACKUP_DIR` (relocating it there if `backup.sh` wrote to
