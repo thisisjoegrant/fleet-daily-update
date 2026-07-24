@@ -184,6 +184,7 @@ list_available_backups() {
 # Matches input against available_backups (with/without .sql.gz); prints match.
 match_backup() {
     local input="$1" b
+    [[ ${#available_backups[@]} -eq 0 ]] && return 1
     for b in "${available_backups[@]}"; do
         if [[ "$b" == "$input" || "$b" == "${input}.sql.gz" ]]; then
             echo "$b"
@@ -500,7 +501,11 @@ for arg in "$@"; do
         expanded_args+=("$arg")
     fi
 done
-set -- "${expanded_args[@]}"
+if [[ ${#expanded_args[@]} -eq 0 ]]; then
+    set --
+else
+    set -- "${expanded_args[@]}"
+fi
 
 for arg in "$@"; do
     case "$arg" in
