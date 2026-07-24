@@ -186,12 +186,15 @@ daily-update --tuf -s         # TUF build flow, quiet output
 A completely separate flow — does **not** run any of the normal steps above,
 and doesn't touch docker, tmux, the db, or the SCEP server at all:
 
-1. Remembers your current branch, checks out `main`
-2. `git pull`
-3. `make deps` / `make generate` / `make build`
-4. Runs `./my_tuf.sh` in the Fleet directory
-5. Switches back to your original branch
-6. `make deps` / `make generate` / `make build` again, to leave your working
+1. Checks for uncommitted changes first, same `Continue anyway? [Y/n]`
+   prompt as the normal flow (default yes) — this matters here too, since
+   the next step switches branches.
+2. Remembers your current branch, checks out `main`
+3. `git pull`
+4. `make deps` / `make generate` / `make build`
+5. Runs `./my_tuf.sh` in the Fleet directory
+6. Switches back to your original branch
+7. `make deps` / `make generate` / `make build` again, to leave your working
    tree matching where you started
 
 `-s` works with `--tuf`; `-d` and a branch argument are not used in this mode.
@@ -209,16 +212,27 @@ with a migration-looking error, you'll be offered:
   `tools/backup_db/restore.sh`, type `reset` to run `make db-reset` (only
   offered after an actual failure, not on a plain branch switch), or press
   Enter to keep the current db (branch-switch prompt only).
+- **If you type `reset` interactively**, you'll get one more prompt:
+  `This permanently erases the current dev database. Type YES to confirm:`.
+  Anything other than exactly `YES` sends you back to the reset/restore
+  menu rather than proceeding — this is on top of, not instead of, the
+  backup step above.
 
 In `-d` (auto) mode, the branch-switch backup/restore prompt is skipped
 entirely (nothing destructive happens there on its own). A migration
 failure is different: it's about to run a destructive `make db-reset`, so
 a backup is **never skipped**, even in auto mode — it's just not
-interactive. `daily-update` generates a timestamped filename itself (e.g.
-`autobackup-20260724-142441.sql.gz`), backs up to it, confirms the backup
-actually landed in `BACKUP_DIR`, and only then runs `make db-reset`. If the
-backup step fails for any reason, the script stops immediately rather than
-resetting without one.
+interactive, and there's no `YES` prompt either, since `-d` means no
+prompts at all. `daily-update` generates a timestamped filename itself
+(e.g. `autobackup-20260724-142441.sql.gz`), backs up to it, and verifies
+the backup file actually exists (and is non-empty) in `BACKUP_DIR` before
+proceeding — not just that `backup.sh` exited cleanly. If that
+verification fails for any reason (the file's missing, empty, or landed
+somewhere unexpected), the script stops immediately rather than resetting
+without a confirmed backup. The same verification applies to restoring: if
+staging a backup back into the repo root doesn't actually produce a
+readable file, the script stops before calling `restore.sh` at all.
+
 
 `backup.sh`/`restore.sh` write/read relative to the Fleet repo root rather
 than into `BACKUP_DIR` directly — `daily-update` relocates the file into
@@ -280,20 +294,13 @@ continuing. If it still hasn't started after 90 seconds, the script stops
 with a clear message instead of letting the next docker command fail with a
 confusing connection error.
 
+Even after the daemon responds to `docker info`, its internal networking can
+occasionally still be finishing setup — so both `docker compose` calls are
+wrapped with a single automatic retry: if the first attempt fails, the
+script waits 3 seconds and tries once more before giving up and stopping
+with the real error.
+
 This assumes Docker Desktop is installed at its default location
 (`/Applications/Docker.app`, launched via the name "Docker") — a non-default
 install location or a renamed app wouldn't be found by `open -a Docker`,
 though you'd still get a clear timeout message rather than a silent hang.
-
-## Tmux session
-
-Everything long-running lives in a tmux session named `fleet-dev`:
-
-| Window | Runs |
-|---|---|
-| `db` | `fleet serve --dev --config fleet.yml --dev_license --debug --logging_debug` |
-| `ngrok` | `ngrok start local` |
-| `pyserver` | `python3 -m http.server` (only if configured) |
-| `scep` | `scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0` (only if configured) |
-| `watchdog` | polls whichever of the above are enabled and sends a macOS notification if one crashes |
-

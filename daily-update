@@ -91,6 +91,23 @@ ensure_docker_running() {
     info "Docker is up."
 }
 
+# Runs a docker compose subcommand, retrying once after a short pause if it
+# fails. Docker's daemon can respond to `docker info` before its internal
+# networking is fully ready, so a transient failure right after
+# ensure_docker_running is possible even though the daemon itself answered.
+run_docker_compose() {
+    local desc="$1"; shift
+    run_step "$desc" docker compose "$@"
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        warn "${desc} failed — retrying once in case Docker was still finishing startup..."
+        sleep 3
+        run_step "Retrying: ${desc}" docker compose "$@"
+        status=$?
+    fi
+    [[ $status -ne 0 ]] && die_with_log "${desc}" "$LAST_LOG"
+}
+
 tmux_window_exists() {
     tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$1"
 }
@@ -115,7 +132,7 @@ send_ctrl_c() {
 stop_scep() {
     if tmux_window_exists "scep"; then
         info "Stopping 'scep' server..."
-        if pkill -f "scepserver-darwin-arm64" 2>/dev/null; then
+        if pkill -f "scepserver-darwin-arm64.*-port 2016" 2>/dev/null; then
             sleep 1
         else
             warn "No running scepserver-darwin-arm64 process found to stop."
@@ -129,6 +146,11 @@ stop_scep() {
 # (backup.sh writes relative to the Fleet repo root, not into BACKUP_DIR —
 # see the comment on backup_db_prompt below). No prompting involved, so
 # this is safe to call automatically (e.g. in -d/auto mode).
+#
+# Treats any failure to confirm the backup landed in BACKUP_DIR as fatal —
+# a caller further up the chain may be about to run a destructive db
+# operation on the strength of this backup existing, so silently continuing
+# without one is not acceptable.
 run_db_backup() {
     local backup_name="$1"
     backup_name="${backup_name%.sql.gz}.sql.gz"
@@ -138,16 +160,19 @@ run_db_backup() {
     if [[ -f "${FLEET_DIR}/${backup_name}" && "${FLEET_DIR}" != "${BACKUP_DIR}" ]]; then
         mkdir -p "$BACKUP_DIR"
         mv "${FLEET_DIR}/${backup_name}" "${BACKUP_DIR}/${backup_name}"
+        if [[ ! -s "${BACKUP_DIR}/${backup_name}" ]]; then
+            die_with_log "db backup (${backup_name}) — mv reported no error, but the file isn't at ${BACKUP_DIR}/${backup_name}. Refusing to proceed without a confirmed backup." "$LAST_LOG"
+        fi
         info "Moved backup to ${BACKUP_DIR}/${backup_name}"
-    elif [[ ! -f "${BACKUP_DIR}/${backup_name}" ]]; then
+    elif [[ ! -s "${BACKUP_DIR}/${backup_name}" ]]; then
         warn "backup.sh succeeded, but '${backup_name}' isn't in ${FLEET_DIR} or ${BACKUP_DIR}."
         local found
         found=$(find "$FLEET_DIR" -maxdepth 2 -iname "$backup_name" -print -quit 2>/dev/null)
         if [[ -n "$found" ]]; then
             warn "Found it at: ${found}"
-            warn "Run 'daily-update --setup' and set the backup directory to $(dirname "$found") if this is where it always lands."
+            die_with_log "db backup (${backup_name}) — landed at ${found} instead of ${BACKUP_DIR}. Run 'daily-update --setup' to point the backup directory there, then re-run." "$LAST_LOG"
         else
-            warn "Couldn't find it under ${FLEET_DIR} (depth 2) either — check backup.sh's output above for where it actually wrote to."
+            die_with_log "db backup (${backup_name}) — could not locate the file anywhere under ${FLEET_DIR} (depth 2). Refusing to proceed without a confirmed backup." "$LAST_LOG"
         fi
     fi
 }
@@ -196,6 +221,9 @@ restore_db() {
     local file="$1" staged=false
     if [[ -f "${BACKUP_DIR}/${file}" && "${FLEET_DIR}" != "${BACKUP_DIR}" ]]; then
         cp "${BACKUP_DIR}/${file}" "${FLEET_DIR}/${file}"
+        if [[ ! -s "${FLEET_DIR}/${file}" ]]; then
+            die_with_log "db restore (${file}) — could not stage a copy into ${FLEET_DIR} before calling restore.sh" /dev/null
+        fi
         staged=true
     fi
 
@@ -231,6 +259,11 @@ notify() {
     osascript -e "display notification \"\${msg}\" with title \"daily-update\"" 2>/dev/null
     echo "[\$(date '+%H:%M:%S')] \${msg}"
 }
+
+# Grace period before the first check — a just-started process can briefly
+# still show as the parent shell in pane_current_command, which would
+# otherwise look like an immediate false-positive crash.
+sleep 5
 
 while tmux has-session -t "\$SESSION" 2>/dev/null; do
     for window in "\${!EXPECTED[@]}"; do
@@ -358,6 +391,15 @@ run_tuf_flow() {
     local original_branch
     original_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
     info "Currently on '${original_branch}' — will switch back here once the TUF build is done."
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        warn "You have uncommitted changes."
+        read -rp "Continue anyway? [Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn]$ ]]; then
+            error "Aborted by user due to uncommitted changes."
+            exit 1
+        fi
+    fi
 
     run_step "Switching to main" git checkout main
     status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout main" "$LAST_LOG"
@@ -599,8 +641,7 @@ fi
 
 ensure_docker_running
 
-run_step "Stopping docker compose" docker compose down
-status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose down" "$LAST_LOG"
+run_docker_compose "Stopping docker compose" down
 
 # --- 4. Build (deps/generate/build) --------------------------------------------
 
@@ -612,8 +653,7 @@ info "Spinning dev environment back up..."
 
 ensure_docker_running
 
-run_step "Starting docker compose (detached)" docker compose up -d
-status=$?; [[ $status -ne 0 ]] && die_with_log "docker compose up -d" "$LAST_LOG"
+run_docker_compose "Starting docker compose (detached)" up -d
 
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     warn "tmux session '${TMUX_SESSION}' already existed — killing stale session first."
@@ -643,7 +683,13 @@ if [[ $status -ne 0 ]]; then
             while true; do
                 read -rp "Type 'reset' to reset the database, or a backup filename above to restore: " db_action
                 if [[ "$db_action" == "reset" ]]; then
-                    break
+                    read -rp "This permanently erases the current dev database. Type YES to confirm: " reset_confirm
+                    if [[ "$reset_confirm" == "YES" ]]; then
+                        break
+                    fi
+                    warn "Confirmation not given — back to the menu."
+                    db_action=""
+                    continue
                 fi
                 if matched=$(match_backup "$db_action"); then
                     db_action="$matched"
