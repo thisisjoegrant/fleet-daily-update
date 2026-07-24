@@ -157,7 +157,7 @@ daily-update --tuf
 
 | Flag | Description |
 |---|---|
-| `-d`, `--defaults` | Fully automatic — no prompts. Stays on the current branch (unless one is also given), skips db backup/restore prompts, and auto-runs `make db-reset` if a migration failure is hit. Every step still runs; this only skips the interactive parts. |
+| `-d`, `--defaults` | Fully automatic — no prompts. Stays on the current branch (unless one is also given), skips the db backup/restore *menu*, and auto-runs `make db-reset` if a migration failure is hit — but always backs up the db first, to an auto-generated timestamped filename, since that step is never skipped even in automatic mode. Every step still runs; this only skips the interactive parts. |
 | `-s`, `--silent` | Suppresses the raw (dimmed) command output from each step. Step announcements, warnings, and full error output on failure still print — including SCEP start/stop status, if enabled. |
 | `-h`, `--help` | Show usage and exit. Doesn't touch tmux, git, or anything else. |
 | `--setup` | Run the configuration wizard and exit. |
@@ -210,8 +210,15 @@ with a migration-looking error, you'll be offered:
   offered after an actual failure, not on a plain branch switch), or press
   Enter to keep the current db (branch-switch prompt only).
 
-In `-d` (auto) mode, backups are skipped and a migration failure
-auto-resolves via `make db-reset`, without asking.
+In `-d` (auto) mode, the branch-switch backup/restore prompt is skipped
+entirely (nothing destructive happens there on its own). A migration
+failure is different: it's about to run a destructive `make db-reset`, so
+a backup is **never skipped**, even in auto mode — it's just not
+interactive. `daily-update` generates a timestamped filename itself (e.g.
+`autobackup-20260724-142441.sql.gz`), backs up to it, confirms the backup
+actually landed in `BACKUP_DIR`, and only then runs `make db-reset`. If the
+backup step fails for any reason, the script stops immediately rather than
+resetting without one.
 
 `backup.sh`/`restore.sh` write/read relative to the Fleet repo root rather
 than into `BACKUP_DIR` directly — `daily-update` relocates the file into
@@ -290,36 +297,3 @@ Everything long-running lives in a tmux session named `fleet-dev`:
 | `scep` | `scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0` (only if configured) |
 | `watchdog` | polls whichever of the above are enabled and sends a macOS notification if one crashes |
 
-Startup order is docker → db → ngrok → pyserver (if enabled) → scep (if
-enabled). Shutdown reverses that: scep (if enabled) → pyserver (if enabled)
-→ ngrok → db → docker.
-
-```bash
-tmux attach -t fleet-dev     # view any window
-# Ctrl-b w                   # list windows and pick one
-# Ctrl-b d                   # detach again (leaves everything running)
-```
-
-## Known assumptions to double-check
-
-- `BACKUP_DIR` defaults to `<fleet dir>/tools/backup_db` — adjust via
-  `daily-update --setup` if `backup.sh`/`restore.sh` actually write
-  elsewhere.
-- `fleet.yml` is assumed to be in the root of the Fleet directory (used
-  as-is by the `serve` command).
-- The migration-failure detector looks for `FAIL`, `WARNING`, or
-  `missing...migration` (case-insensitive) in `fleet prepare db --dev`'s
-  output — if a real migration failure ever uses different wording, it'll
-  fall through to a plain failure instead of offering backup/reset.
-- The NVM-fallback detector for `make deps` looks for the word `nvm`
-  anywhere, or `node` together with `version`/`engine`/`incompatible`
-  anywhere in the output (order-independent) — this covers the yarn
-  "engine incompatible" error format as well as more typical phrasing.
-- The shared-folder IP lookup assumes `en0` is your active network
-  interface (typical for Wi-Fi on most Macs). If you're primarily on a
-  different interface, the printed IP may be wrong or missing.
-- SCEP shutdown assumes the binary is exactly named `scepserver-darwin-arm64`
-  and that no other unrelated process on your machine matches that name —
-  `pkill -f` is scoped to that string specifically to keep this safe.
-- Docker Desktop auto-start assumes it's installed at the default location
-  and named "Docker" — see the Docker Desktop auto-start section above.

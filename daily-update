@@ -125,34 +125,39 @@ stop_scep() {
     fi
 }
 
-# Prompts for an optional backup filename and runs backup.sh if one is given.
-# backup.sh writes relative to the working directory it's run from (the
-# Fleet repo root, since that's our cwd throughout), not into BACKUP_DIR —
-# so we relocate the file afterward to keep backups organized in one place.
+# Runs backup.sh for a given name and relocates the file into BACKUP_DIR
+# (backup.sh writes relative to the Fleet repo root, not into BACKUP_DIR —
+# see the comment on backup_db_prompt below). No prompting involved, so
+# this is safe to call automatically (e.g. in -d/auto mode).
+run_db_backup() {
+    local backup_name="$1"
+    backup_name="${backup_name%.sql.gz}.sql.gz"
+    run_step "Backing up db to ${backup_name}" "$FLEET_DIR/tools/backup_db/backup.sh" "$backup_name"
+    status=$?; [[ $status -ne 0 ]] && die_with_log "db backup (${backup_name})" "$LAST_LOG"
+
+    if [[ -f "${FLEET_DIR}/${backup_name}" && "${FLEET_DIR}" != "${BACKUP_DIR}" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        mv "${FLEET_DIR}/${backup_name}" "${BACKUP_DIR}/${backup_name}"
+        info "Moved backup to ${BACKUP_DIR}/${backup_name}"
+    elif [[ ! -f "${BACKUP_DIR}/${backup_name}" ]]; then
+        warn "backup.sh succeeded, but '${backup_name}' isn't in ${FLEET_DIR} or ${BACKUP_DIR}."
+        local found
+        found=$(find "$FLEET_DIR" -maxdepth 2 -iname "$backup_name" -print -quit 2>/dev/null)
+        if [[ -n "$found" ]]; then
+            warn "Found it at: ${found}"
+            warn "Run 'daily-update --setup' and set the backup directory to $(dirname "$found") if this is where it always lands."
+        else
+            warn "Couldn't find it under ${FLEET_DIR} (depth 2) either — check backup.sh's output above for where it actually wrote to."
+        fi
+    fi
+}
+
+# Prompts for an optional backup filename and runs run_db_backup if one is
+# given.
 backup_db_prompt() {
     local prompt="$1" backup_name
     read -rp "$prompt" backup_name
-    if [[ -n "$backup_name" ]]; then
-        backup_name="${backup_name%.sql.gz}.sql.gz"
-        run_step "Backing up db to ${backup_name}" "$FLEET_DIR/tools/backup_db/backup.sh" "$backup_name"
-        status=$?; [[ $status -ne 0 ]] && die_with_log "db backup (${backup_name})" "$LAST_LOG"
-
-        if [[ -f "${FLEET_DIR}/${backup_name}" && "${FLEET_DIR}" != "${BACKUP_DIR}" ]]; then
-            mkdir -p "$BACKUP_DIR"
-            mv "${FLEET_DIR}/${backup_name}" "${BACKUP_DIR}/${backup_name}"
-            info "Moved backup to ${BACKUP_DIR}/${backup_name}"
-        elif [[ ! -f "${BACKUP_DIR}/${backup_name}" ]]; then
-            warn "backup.sh succeeded, but '${backup_name}' isn't in ${FLEET_DIR} or ${BACKUP_DIR}."
-            local found
-            found=$(find "$FLEET_DIR" -maxdepth 2 -iname "$backup_name" -print -quit 2>/dev/null)
-            if [[ -n "$found" ]]; then
-                warn "Found it at: ${found}"
-                warn "Run 'daily-update --setup' and set the backup directory to $(dirname "$found") if this is where it always lands."
-            else
-                warn "Couldn't find it under ${FLEET_DIR} (depth 2) either — check backup.sh's output above for where it actually wrote to."
-            fi
-        fi
-    fi
+    [[ -n "$backup_name" ]] && run_db_backup "$backup_name"
 }
 
 # Populates the global `available_backups` array and prints it.
@@ -626,7 +631,9 @@ if [[ $status -ne 0 ]]; then
         tail -n 20 "$LAST_LOG"
 
         if [[ "$AUTO_MODE" == "true" ]]; then
-            warn "Auto mode (-d): skipping backup and running 'make db-reset' automatically."
+            auto_backup_name="autobackup-$(date +%Y%m%d-%H%M%S)"
+            warn "Auto mode (-d): backing up db to ${auto_backup_name}.sql.gz before resetting (this step is not skippable)."
+            run_db_backup "$auto_backup_name"
             db_action="reset"
         else
             backup_db_prompt "Database migration failed. To back up the current db before resetting, enter a filename (or press Enter to skip): "
