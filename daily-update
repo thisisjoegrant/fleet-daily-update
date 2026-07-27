@@ -428,6 +428,25 @@ run_tuf_flow() {
     info "TUF build complete. Back on branch '$(git rev-parse --abbrev-ref HEAD)'."
 }
 
+# Stops scep/pyserver/ngrok/db (if their tmux windows exist) and runs
+# docker compose down. Shared by the normal flow and 'daily-update down'.
+spin_down() {
+    info "Spinning down dev environment..."
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        [[ -n "$SCEP_DIR" ]] && stop_scep
+        [[ -n "$SHARED_DIR" ]] && send_ctrl_c "pyserver"
+        send_ctrl_c "ngrok"
+        send_ctrl_c "db"
+        tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    else
+        warn "No existing tmux session '${TMUX_SESSION}' — skipping scep/python/ngrok/db shutdown."
+    fi
+
+    ensure_docker_running
+    run_docker_compose "Stopping docker compose" down
+}
+
 show_help() {
     cat <<HELP_EOF
 daily-update — update, rebuild, and restart the Fleet dev environment
@@ -435,22 +454,29 @@ daily-update — update, rebuild, and restart the Fleet dev environment
 USAGE:
   daily-update [branch] [options]
   daily-update --tuf
+  daily-update --only=<down|branch|update|up>
 
-WHAT IT DOES (in order):
-  1. git status / git pull
-  2. Prompts for a branch to switch to (or keep the current one). If you
-     switch branches, offers to back up the current db, then offers to
-     restore a different backup — both while the old containers are still
-     up, since the backup/restore scripts need that docker network.
-  3. Spins down: stops the SCEP server (if configured), Ctrl-C to the
-     pyserver/ngrok/db tmux windows, then 'docker compose down'
-  4. 'make deps' (auto-retries once via NVM if it looks like a node
-     version issue), 'make generate', 'make build'
-  5. Spins back up: 'docker compose up -d', then 'fleet prepare db --dev'
-     (if that fails with a migration-looking error, offers backup, then
-     'reset' or restore-from-backup, then retries), then starts db/ngrok/
-     pyserver (if configured)/scep (if configured)/watchdog in tmux window
-     'fleet-dev'
+WHAT IT DOES (in order — same four phases run individually with --only=):
+  1. [branch]  git status / git pull. Prompts for a branch to switch to (or
+     keep the current one). If you switch branches, offers to back up the
+     current db, then offers to restore a different backup — both while
+     the old containers are still up, since the backup/restore scripts
+     need that docker network.
+  2. [down]    Stops the SCEP server (if configured), Ctrl-C to the
+     pyserver/ngrok/db tmux windows, then 'docker compose down'. Launches
+     Docker Desktop automatically first if it isn't running.
+  3. [update]  'make deps' (auto-retries once via NVM if it looks like a
+     node version issue), 'make generate', 'make build'
+  4. [up]      'docker compose up -d', then 'fleet prepare db --dev' (if
+     that fails with a migration-looking error: auto-checks
+     migration-cleanup, then offers backup, then 'cleanup'/'reset'/restore,
+     then retries), then starts db/ngrok/pyserver (if configured)/scep (if
+     configured)/watchdog in tmux window 'fleet-dev'
+
+--only=<phase> runs exactly one of the phases above and exits — useful for
+e.g. just shutting everything down without touching git or rebuilding
+(handy if Docker Desktop needs to quit for an update and you don't want to
+stop each tmux window by hand).
 
 --tuf MODE (completely separate — does not run any of the steps above,
 no docker/tmux/db/scep involved at all):
@@ -466,13 +492,15 @@ ARGUMENTS:
   branch              Optional. Branch to switch to. Skips the interactive
                        branch prompt. If omitted, you'll be prompted (unless
                        -d is also set, in which case it stays on the current
-                       branch). Not used in --tuf mode.
+                       branch). Not used in --tuf mode or with most --only
+                       values (only relevant to --only=branch and the full run).
 
 OPTIONS:
   -d, --defaults       Fully automatic — no prompts. Keeps the current
                        branch (unless one is also given), skips db backup/
                        restore prompts, and auto-runs 'make db-reset' if a
-                       migration failure is hit. Every step above still
+                       migration failure is hit (or migration-cleanup, if
+                       it finds a clean fix). Every step above still
                        runs — this only skips the interactive parts.
                        Not used in --tuf mode.
   -s, --silent         Suppresses the raw (dimmed) command output from each
@@ -481,8 +509,11 @@ OPTIONS:
   -h, --help           Show this help and exit.
   --tuf                Run the separate TUF build flow described above,
                        instead of the normal daily-update steps.
+  --only=<phase>       Run just one phase — down, branch, update, or up —
+                       instead of the full sequence. See WHAT IT DOES above.
   --setup              Run the interactive setup wizard to (re)configure
-                       FLEET_DIR, SHARED_DIR, BACKUP_DIR, and SCEP_DIR,
+                       FLEET_DIR, SHARED_DIR, BACKUP_DIR, SCEP_DIR, and the
+                       DB_USER/DB_PASSWORD/DB_NAME used by migration-cleanup,
                        stored in ~/.daily-update.conf. Runs automatically
                        the first time, or if FLEET_DIR no longer looks
                        valid, or SCEP_DIR is set but no longer valid — you
@@ -498,6 +529,8 @@ EXAMPLES:
   daily-update my-branch -d     Auto mode, but switch to my-branch first
   daily-update -s               Normal interactive flow, quiet output
   daily-update -d -s            Fully automatic AND quiet
+  daily-update --only=down      Just stop everything (docker/tmux windows)
+  daily-update --only=up        Just bring it back up (skips git/build)
   daily-update --setup          Reconfigure FLEET_DIR/SHARED_DIR/BACKUP_DIR
   daily-update --tuf            Run the separate TUF build flow
   daily-update --tuf -s         TUF build flow, quiet output
@@ -561,262 +594,278 @@ for arg in "$@"; do
     esac
 done
 
-require_tmux
-
 # Flags: -d/--defaults runs fully non-interactively (same branch, no backup,
 # auto db-reset on migration failure). -s/--silent suppresses raw command
 # output, showing only step announcements, warnings, and errors.
+# --only=<phase> runs a single phase (down/branch/update/up) instead of the
+# full sequence — see the Dispatch section near the end of the script.
 AUTO_MODE=false
 target_branch=""
+ONLY_MODE=""
 for arg in "$@"; do
     case "$arg" in
         -d|--defaults) AUTO_MODE=true ;;
         -s|--silent) SILENT=true ;;
+        --only=*) ONLY_MODE="${arg#--only=}" ;;
         *) target_branch="$arg" ;;
     esac
 done
 
-# --- 1. Sync repo state -------------------------------------------------------
+case "$ONLY_MODE" in
+    ""|down|branch|update|up) ;;
+    *) die_with_log "Unknown --only value '${ONLY_MODE}' — expected one of: down, branch, update, up" /dev/null ;;
+esac
 
-run_step "Checking git status" git status
-status=$?; [[ $status -ne 0 ]] && die_with_log "git status" "$LAST_LOG"
-
-# Warn on uncommitted changes before we pull/checkout under them
-if [[ -n "$(git status --porcelain)" ]]; then
-    warn "You have uncommitted changes."
-    if [[ "$AUTO_MODE" == "true" ]]; then
-        info "Auto mode (-d): continuing automatically."
-    else
-        read -rp "Continue anyway? [Y/n]: " confirm
-        if [[ "$confirm" =~ ^[Nn]$ ]]; then
-            error "Aborted by user due to uncommitted changes."
-            exit 1
-        fi
-    fi
+# down/up/the full sequence all need tmux; branch/update alone don't.
+if [[ "$ONLY_MODE" != "branch" && "$ONLY_MODE" != "update" ]]; then
+    require_tmux
 fi
 
-run_step "Pulling latest changes" git pull
-status=$?; [[ $status -ne 0 ]] && die_with_log "git pull" "$LAST_LOG"
+# --- Phase functions -----------------------------------------------------------
 
-current_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
+# Phase: git status/pull, branch selection, and backup/restore while the old
+# env is still up (backup.sh/restore.sh need the live docker network).
+run_branch_phase() {
+    run_step "Checking git status" git status
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git status" "$LAST_LOG"
 
-# --- 2. Branch selection, and backup/restore while the old env is still up ----
-# (must happen before spin-down — backup.sh/restore.sh need the live docker network)
-
-echo ""
-echo "Current branch: ${current_branch}"
-
-if [[ -z "$target_branch" && "$AUTO_MODE" != "true" ]]; then
-    read -rp "Enter a different branch to switch to, or press Enter to stay on '${current_branch}': " target_branch
-fi
-
-if [[ -n "${target_branch}" && "${target_branch}" != "${current_branch}" ]]; then
-    run_step "Switching to branch '${target_branch}'" git checkout "${target_branch}"
-    status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout ${target_branch}" "$LAST_LOG"
-
-    if [[ "$AUTO_MODE" == "true" ]]; then
-        info "Auto mode (-d): skipping db backup/restore prompts."
-    else
-        echo ""
-        backup_db_prompt "Switching branches — back up the current db first? Enter a filename, or press Enter to skip: "
-
-        list_available_backups
-        read -rp "Restore one of the backups above before continuing, or press Enter to keep the current db: " restore_choice
-        if [[ -n "$restore_choice" ]]; then
-            if matched=$(match_backup "$restore_choice"); then
-                restore_db "$matched"
-            else
-                warn "'${restore_choice}' doesn't match a known backup — keeping the current db."
+    if [[ -n "$(git status --porcelain)" ]]; then
+        warn "You have uncommitted changes."
+        if [[ "$AUTO_MODE" == "true" ]]; then
+            info "Auto mode (-d): continuing automatically."
+        else
+            read -rp "Continue anyway? [Y/n]: " confirm
+            if [[ "$confirm" =~ ^[Nn]$ ]]; then
+                error "Aborted by user due to uncommitted changes."
+                exit 1
             fi
         fi
     fi
-else
-    info "Staying on '${current_branch}'"
-fi
 
-# --- 3. Spin down dev environment ----------------------------------------------
+    run_step "Pulling latest changes" git pull
+    status=$?; [[ $status -ne 0 ]] && die_with_log "git pull" "$LAST_LOG"
 
-info "Spinning down dev environment..."
+    current_branch=$(git rev-parse --abbrev-ref HEAD) || { error "Could not determine current branch"; exit 1; }
 
-if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    [[ -n "$SCEP_DIR" ]] && stop_scep
-    [[ -n "$SHARED_DIR" ]] && send_ctrl_c "pyserver"
-    send_ctrl_c "ngrok"
-    send_ctrl_c "db"
-    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-else
-    warn "No existing tmux session '${TMUX_SESSION}' — skipping scep/python/ngrok/db shutdown."
-fi
+    echo ""
+    echo "Current branch: ${current_branch}"
 
-ensure_docker_running
+    if [[ -z "$target_branch" && "$AUTO_MODE" != "true" ]]; then
+        read -rp "Enter a different branch to switch to, or press Enter to stay on '${current_branch}': " target_branch
+    fi
 
-run_docker_compose "Stopping docker compose" down
-
-# --- 4. Build (deps/generate/build) --------------------------------------------
-
-build_fleet
-
-# --- 5. Spin dev environment back up -------------------------------------------
-
-info "Spinning dev environment back up..."
-
-ensure_docker_running
-
-run_docker_compose "Starting docker compose (detached)" up -d
-
-if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    warn "tmux session '${TMUX_SESSION}' already existed — killing stale session first."
-    tmux kill-session -t "$TMUX_SESSION"
-fi
-
-# Foreground, not tmux — one-shot command, unlike `serve` which runs forever.
-run_step "Preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
-status=$?
-if [[ $status -ne 0 ]]; then
-    if grep -qiE 'FAIL|WARNING|missing.*migration' "$LAST_LOG"; then
-        warn "fleet prepare db --dev failed and looks migration-related (common after switching to an older branch, or after pulling renumbered migrations)."
-        echo -e "${RED}--- Details ---${NC}"
-        tail -n 20 "$LAST_LOG"
-
-        # Dry-run is read-only, so check automatically whether this looks
-        # like a renumbered-migration conflict before deciding what to do.
-        cleanup_branch=$(git rev-parse --abbrev-ref HEAD)
-        migration_cleanup_dry_run "$cleanup_branch"
-        dry_run_status=$?
-        cleanup_found=false
-        if [[ $dry_run_status -eq 0 ]] && grep -q "Dry-run: SQL will apply cleanly." "$LAST_LOG"; then
-            cleanup_found=true
-            info "migration-cleanup found renumbered migrations on '${cleanup_branch}' and reports a clean fix (see output above)."
-        elif grep -qE 'Found [1-9][0-9]* migration renumber' "$LAST_LOG"; then
-            warn "migration-cleanup found renumbered migrations on '${cleanup_branch}', but reported issues (dry-run exit ${dry_run_status}) rather than a clean fix. Not recommending it automatically — review the output above if you want to try it manually anyway."
-        fi
+    if [[ -n "${target_branch}" && "${target_branch}" != "${current_branch}" ]]; then
+        run_step "Switching to branch '${target_branch}'" git checkout "${target_branch}"
+        status=$?; [[ $status -ne 0 ]] && die_with_log "git checkout ${target_branch}" "$LAST_LOG"
 
         if [[ "$AUTO_MODE" == "true" ]]; then
-            auto_backup_name="autobackup-$(date +%Y%m%d-%H%M%S)"
-            warn "Auto mode (-d): backing up db to ${auto_backup_name}.sql.gz before attempting a fix (this step is not skippable)."
-            run_db_backup "$auto_backup_name"
-
-            if [[ "$cleanup_found" == "true" ]]; then
-                warn "Auto mode (-d): applying migration-cleanup automatically (less destructive than a full reset)."
-                migration_cleanup_apply "$cleanup_branch"
-                db_action="cleanup"
-            else
-                warn "Auto mode (-d): migration-cleanup not applicable — running 'make db-reset' instead."
-                db_action="reset"
-            fi
+            info "Auto mode (-d): skipping db backup/restore prompts."
         else
-            backup_db_prompt "Back up the current db before continuing? Enter a filename (or press Enter to skip): "
-            list_available_backups
+            echo ""
+            backup_db_prompt "Switching branches — back up the current db first? Enter a filename, or press Enter to skip: "
 
-            db_action=""
-            while true; do
-                if [[ "$cleanup_found" == "true" ]]; then
-                    read -rp "Type 'cleanup' (recommended — see above) to apply the fix, 'reset' to reset the database, or a backup filename above to restore: " db_action
+            list_available_backups
+            read -rp "Restore one of the backups above before continuing, or press Enter to keep the current db: " restore_choice
+            if [[ -n "$restore_choice" ]]; then
+                if matched=$(match_backup "$restore_choice"); then
+                    restore_db "$matched"
                 else
-                    read -rp "Type 'reset' to reset the database, 'cleanup' to try migration-cleanup manually, or a backup filename above to restore: " db_action
+                    warn "'${restore_choice}' doesn't match a known backup — keeping the current db."
                 fi
-                if [[ "$db_action" == "reset" ]]; then
-                    read -rp "This permanently erases the current dev database. Type YES to confirm: " reset_confirm
-                    if [[ "$reset_confirm" == "YES" ]]; then
+            fi
+        fi
+    else
+        info "Staying on '${current_branch}'"
+    fi
+}
+
+# Phase: docker up, db prep (with migration-failure recovery), and start
+# db/ngrok/pyserver/scep/watchdog tmux windows.
+run_up_phase() {
+    info "Spinning dev environment back up..."
+
+    ensure_docker_running
+
+    run_docker_compose "Starting docker compose (detached)" up -d
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        warn "tmux session '${TMUX_SESSION}' already existed — killing stale session first."
+        tmux kill-session -t "$TMUX_SESSION"
+    fi
+
+    # Foreground, not tmux — one-shot command, unlike `serve` which runs forever.
+    run_step "Preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        if grep -qiE 'FAIL|WARNING|missing.*migration' "$LAST_LOG"; then
+            warn "fleet prepare db --dev failed and looks migration-related (common after switching to an older branch, or after pulling renumbered migrations)."
+            echo -e "${RED}--- Details ---${NC}"
+            tail -n 20 "$LAST_LOG"
+
+            # Dry-run is read-only, so check automatically whether this looks
+            # like a renumbered-migration conflict before deciding what to do.
+            cleanup_branch=$(git rev-parse --abbrev-ref HEAD)
+            migration_cleanup_dry_run "$cleanup_branch"
+            dry_run_status=$?
+            cleanup_found=false
+            if [[ $dry_run_status -eq 0 ]] && grep -q "Dry-run: SQL will apply cleanly." "$LAST_LOG"; then
+                cleanup_found=true
+                info "migration-cleanup found renumbered migrations on '${cleanup_branch}' and reports a clean fix (see output above)."
+            elif grep -qE 'Found [1-9][0-9]* migration renumber' "$LAST_LOG"; then
+                warn "migration-cleanup found renumbered migrations on '${cleanup_branch}', but reported issues (dry-run exit ${dry_run_status}) rather than a clean fix. Not recommending it automatically — review the output above if you want to try it manually anyway."
+            fi
+
+            if [[ "$AUTO_MODE" == "true" ]]; then
+                auto_backup_name="autobackup-$(date +%Y%m%d-%H%M%S)"
+                warn "Auto mode (-d): backing up db to ${auto_backup_name}.sql.gz before attempting a fix (this step is not skippable)."
+                run_db_backup "$auto_backup_name"
+
+                if [[ "$cleanup_found" == "true" ]]; then
+                    warn "Auto mode (-d): applying migration-cleanup automatically (less destructive than a full reset)."
+                    migration_cleanup_apply "$cleanup_branch"
+                    db_action="cleanup"
+                else
+                    warn "Auto mode (-d): migration-cleanup not applicable — running 'make db-reset' instead."
+                    db_action="reset"
+                fi
+            else
+                backup_db_prompt "Back up the current db before continuing? Enter a filename (or press Enter to skip): "
+                list_available_backups
+
+                db_action=""
+                while true; do
+                    if [[ "$cleanup_found" == "true" ]]; then
+                        read -rp "Type 'cleanup' (recommended — see above) to apply the fix, 'reset' to reset the database, or a backup filename above to restore: " db_action
+                    else
+                        read -rp "Type 'reset' to reset the database, 'cleanup' to try migration-cleanup manually, or a backup filename above to restore: " db_action
+                    fi
+                    if [[ "$db_action" == "reset" ]]; then
+                        read -rp "This permanently erases the current dev database. Type YES to confirm: " reset_confirm
+                        if [[ "$reset_confirm" == "YES" ]]; then
+                            break
+                        fi
+                        warn "Confirmation not given — back to the menu."
+                        db_action=""
+                        continue
+                    fi
+                    if [[ "$db_action" == "cleanup" ]]; then
                         break
                     fi
-                    warn "Confirmation not given — back to the menu."
-                    db_action=""
-                    continue
-                fi
-                if [[ "$db_action" == "cleanup" ]]; then
-                    break
-                fi
-                if matched=$(match_backup "$db_action"); then
-                    db_action="$matched"
-                    break
-                fi
-                warn "'${db_action}' isn't 'reset', 'cleanup', or a known backup filename. Try again."
-            done
-        fi
-
-        if [[ "$db_action" == "reset" ]]; then
-            run_step "Running make db-reset" make db-reset
-            status=$?; [[ $status -ne 0 ]] && die_with_log "make db-reset" "$LAST_LOG"
-        elif [[ "$db_action" == "cleanup" ]]; then
-            if [[ "$AUTO_MODE" != "true" ]]; then
-                if [[ "$cleanup_found" != "true" ]]; then
-                    read -rp "Branch to compare against main for renumbered migrations (press Enter to use current branch, ${cleanup_branch}): " manual_branch
-                    cleanup_branch="${manual_branch:-$cleanup_branch}"
-                    migration_cleanup_dry_run "$cleanup_branch"
-                    status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup dry-run" "$LAST_LOG"
-                fi
-                read -rp "Apply the migration-cleanup SQL shown above? Type YES to confirm: " cleanup_confirm
-                if [[ "$cleanup_confirm" != "YES" ]]; then
-                    die_with_log "migration-cleanup (declined apply)" /dev/null
-                fi
-                migration_cleanup_apply "$cleanup_branch"
+                    if matched=$(match_backup "$db_action"); then
+                        db_action="$matched"
+                        break
+                    fi
+                    warn "'${db_action}' isn't 'reset', 'cleanup', or a known backup filename. Try again."
+                done
             fi
+
+            if [[ "$db_action" == "reset" ]]; then
+                run_step "Running make db-reset" make db-reset
+                status=$?; [[ $status -ne 0 ]] && die_with_log "make db-reset" "$LAST_LOG"
+            elif [[ "$db_action" == "cleanup" ]]; then
+                if [[ "$AUTO_MODE" != "true" ]]; then
+                    if [[ "$cleanup_found" != "true" ]]; then
+                        read -rp "Branch to compare against main for renumbered migrations (press Enter to use current branch, ${cleanup_branch}): " manual_branch
+                        cleanup_branch="${manual_branch:-$cleanup_branch}"
+                        migration_cleanup_dry_run "$cleanup_branch"
+                        status=$?; [[ $status -ne 0 ]] && die_with_log "migration-cleanup dry-run" "$LAST_LOG"
+                    fi
+                    read -rp "Apply the migration-cleanup SQL shown above? Type YES to confirm: " cleanup_confirm
+                    if [[ "$cleanup_confirm" != "YES" ]]; then
+                        die_with_log "migration-cleanup (declined apply)" /dev/null
+                    fi
+                    migration_cleanup_apply "$cleanup_branch"
+                fi
+            else
+                restore_db "$db_action"
+            fi
+
+            run_step "Retrying: preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
+            status=$?; [[ $status -ne 0 ]] && die_with_log "fleet prepare db --dev (after db ${db_action})" "$LAST_LOG"
         else
-            restore_db "$db_action"
+            die_with_log "fleet prepare db --dev" "$LAST_LOG"
         fi
-
-        run_step "Retrying: preparing dev database" "$FLEET_DIR/build/fleet" prepare db --dev
-        status=$?; [[ $status -ne 0 ]] && die_with_log "fleet prepare db --dev (after db ${db_action})" "$LAST_LOG"
-    else
-        die_with_log "fleet prepare db --dev" "$LAST_LOG"
     fi
-fi
 
-tmux new-session -d -s "$TMUX_SESSION" -n db
-info "Starting db server (tmux window 'db')..."
-tmux send-keys -t "${TMUX_SESSION}:db" \
-    "$FLEET_DIR/build/fleet serve --dev --config fleet.yml --dev_license --debug --logging_debug" C-m
+    tmux new-session -d -s "$TMUX_SESSION" -n db
+    info "Starting db server (tmux window 'db')..."
+    tmux send-keys -t "${TMUX_SESSION}:db" \
+        "$FLEET_DIR/build/fleet serve --dev --config fleet.yml --dev_license --debug --logging_debug" C-m
 
-tmux new-window -t "$TMUX_SESSION" -n ngrok
-info "Starting ngrok (tmux window 'ngrok')..."
-tmux send-keys -t "${TMUX_SESSION}:ngrok" "ngrok start local" C-m
+    tmux new-window -t "$TMUX_SESSION" -n ngrok
+    info "Starting ngrok (tmux window 'ngrok')..."
+    tmux send-keys -t "${TMUX_SESSION}:ngrok" "ngrok start local" C-m
 
-if [[ -n "$SHARED_DIR" ]]; then
-    tmux new-window -t "$TMUX_SESSION" -n pyserver
-    info "Starting python http.server in ${SHARED_DIR} (tmux window 'pyserver')..."
-    tmux send-keys -t "${TMUX_SESSION}:pyserver" "cd ${SHARED_DIR} && python3 -m http.server" C-m
-    pyserver_ip=$(ipconfig getifaddr en0 2>/dev/null)
-else
-    info "SHARED_DIR not configured — skipping python http.server (run 'daily-update --setup' to enable it)."
-fi
-
-if [[ -n "$SCEP_DIR" ]]; then
-    tmux new-window -t "$TMUX_SESSION" -n scep
-    info "Starting SCEP server (tmux window 'scep')..."
-    tmux send-keys -t "${TMUX_SESSION}:scep" \
-        "cd ${SCEP_DIR} && ./scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0" C-m
-    sleep 2
-    scep_current=$(tmux list-panes -t "${TMUX_SESSION}:scep" -F '#{pane_current_command}' 2>/dev/null | head -n1)
-    # tmux truncates pane_current_command to 15 chars, so compare as a
-    # prefix rather than an exact match (e.g. "scepserver-darw" is a valid
-    # truncation of "scepserver-darwin-arm64", not a different process).
-    if [[ -n "$scep_current" && "scepserver-darwin-arm64" == "${scep_current}"* ]]; then
-        info "SCEP server started successfully."
+    if [[ -n "$SHARED_DIR" ]]; then
+        tmux new-window -t "$TMUX_SESSION" -n pyserver
+        info "Starting python http.server in ${SHARED_DIR} (tmux window 'pyserver')..."
+        tmux send-keys -t "${TMUX_SESSION}:pyserver" "cd ${SHARED_DIR} && python3 -m http.server" C-m
+        pyserver_ip=$(ipconfig getifaddr en0 2>/dev/null)
     else
-        warn "SCEP server may have failed to start — pane is running '${scep_current}' instead of scepserver-darwin-arm64."
-        echo -e "${RED}--- scep window output ---${NC}"
-        tmux capture-pane -p -t "${TMUX_SESSION}:scep" | tail -n 20
+        info "SHARED_DIR not configured — skipping python http.server (run 'daily-update --setup' to enable it)."
     fi
-else
-    info "SCEP_DIR not configured — skipping SCEP server (run 'daily-update --setup' to enable it)."
-fi
 
-write_watchdog_script
-tmux new-window -t "$TMUX_SESSION" -n watchdog
-tmux send-keys -t "${TMUX_SESSION}:watchdog" "bash '$WATCHDOG_SCRIPT'" C-m
-info "Watchdog running (tmux window 'watchdog') — alerts via macOS notification if db/ngrok$( [[ -n "$SCEP_DIR" ]] && echo '/scep')$( [[ -n "$SHARED_DIR" ]] && echo '/pyserver') exit unexpectedly."
-
-echo ""
-info "All done! Branch: $(git rev-parse --abbrev-ref HEAD)"
-info "Dev processes are running in tmux session '${TMUX_SESSION}'."
-if [[ -n "$SHARED_DIR" ]]; then
-    if [[ -n "${pyserver_ip:-}" ]]; then
-        info "Shared folder available at ${pyserver_ip}:8000"
+    if [[ -n "$SCEP_DIR" ]]; then
+        tmux new-window -t "$TMUX_SESSION" -n scep
+        info "Starting SCEP server (tmux window 'scep')..."
+        tmux send-keys -t "${TMUX_SESSION}:scep" \
+            "cd ${SCEP_DIR} && ./scepserver-darwin-arm64 -depot depot -port 2016 -challenge=secret -allowrenew 0" C-m
+        sleep 2
+        scep_current=$(tmux list-panes -t "${TMUX_SESSION}:scep" -F '#{pane_current_command}' 2>/dev/null | head -n1)
+        # tmux truncates pane_current_command to 15 chars, so compare as a
+        # prefix rather than an exact match (e.g. "scepserver-darw" is a valid
+        # truncation of "scepserver-darwin-arm64", not a different process).
+        if [[ -n "$scep_current" && "scepserver-darwin-arm64" == "${scep_current}"* ]]; then
+            info "SCEP server started successfully."
+        else
+            warn "SCEP server may have failed to start — pane is running '${scep_current}' instead of scepserver-darwin-arm64."
+            echo -e "${RED}--- scep window output ---${NC}"
+            tmux capture-pane -p -t "${TMUX_SESSION}:scep" | tail -n 20
+        fi
     else
-        warn "Could not determine local IP (ipconfig getifaddr en0) — check the 'pyserver' window."
+        info "SCEP_DIR not configured — skipping SCEP server (run 'daily-update --setup' to enable it)."
     fi
-fi
-echo -e "${DIM}  View them:      tmux attach -t ${TMUX_SESSION}${NC}"
-echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SCEP_DIR" ]] && echo ', scep')$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
-echo -e "${DIM}  Detach again:   Ctrl-b then d${NC}"
+
+    write_watchdog_script
+    tmux new-window -t "$TMUX_SESSION" -n watchdog
+    tmux send-keys -t "${TMUX_SESSION}:watchdog" "bash '$WATCHDOG_SCRIPT'" C-m
+    info "Watchdog running (tmux window 'watchdog') — alerts via macOS notification if db/ngrok$( [[ -n "$SCEP_DIR" ]] && echo '/scep')$( [[ -n "$SHARED_DIR" ]] && echo '/pyserver') exit unexpectedly."
+
+    echo ""
+    info "All done! Branch: $(git rev-parse --abbrev-ref HEAD)"
+    info "Dev processes are running in tmux session '${TMUX_SESSION}'."
+    if [[ -n "$SHARED_DIR" ]]; then
+        if [[ -n "${pyserver_ip:-}" ]]; then
+            info "Shared folder available at ${pyserver_ip}:8000"
+        else
+            warn "Could not determine local IP (ipconfig getifaddr en0) — check the 'pyserver' window."
+        fi
+    fi
+    echo -e "${DIM}  View them:      tmux attach -t ${TMUX_SESSION}${NC}"
+    echo -e "${DIM}  Switch windows: Ctrl-b w to list windows (db, ngrok$( [[ -n "$SCEP_DIR" ]] && echo ', scep')$( [[ -n "$SHARED_DIR" ]] && echo ', pyserver'), watchdog), then pick one${NC}"
+    echo -e "${DIM}  Detach again:   Ctrl-b then d${NC}"
+}
+
+# --- Dispatch --------------------------------------------------------------
+
+case "$ONLY_MODE" in
+    down)
+        spin_down
+        info "Dev environment is down."
+        ;;
+    branch)
+        run_branch_phase
+        ;;
+    update)
+        build_fleet
+        ;;
+    up)
+        run_up_phase
+        ;;
+    "")
+        run_branch_phase
+        spin_down
+        build_fleet
+        run_up_phase
+        ;;
+esac
